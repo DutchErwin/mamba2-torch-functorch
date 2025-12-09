@@ -1706,7 +1706,7 @@ def _chunk_scan_bwd_ddAcs_prev(prev_states, C, dout, dA_cumsum, seq_idx=None):
 class ChunkScanFn(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, B, C, x, dt, dA_cumsum, prev_states, D=None, z=None):
+    def forward(B, C, x, dt, dA_cumsum, prev_states, D=None, z=None):
         # Check constraints.
         batch, seqlen, nheads, headdim = x.shape
         _, _, ngroups, dstate = B.shape
@@ -1733,11 +1733,29 @@ class ChunkScanFn(torch.autograd.Function):
             D = D.contiguous()
         CB = _bmm_chunk_fwd(C, B, chunk_size)
         out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, prev_states, D=D, z=z)
-        ctx.save_for_backward(out if z is None else out_x, B, C, CB, x, dt, dA_cumsum, prev_states, D, z)
-        return out
+        # Return out (user-facing), and views of tensors needed for backward
+        # out_x is returned separately for conditional save logic in setup_context
+        # (PyTorch requires views, not original tensors, when using setup_context)
+        return (out, out_x.view_as(out_x) if out_x is not None else None,
+                B.view_as(B), C.view_as(C), CB.view_as(CB), x.view_as(x),
+                dt.view_as(dt), dA_cumsum.view_as(dA_cumsum), prev_states.view_as(prev_states),
+                D.view_as(D) if D is not None else None,
+                z.view_as(z) if z is not None else None)
 
     @staticmethod
-    def backward(ctx, dout):
+    def setup_context(ctx, inputs, output):
+        B, C, x, dt, dA_cumsum, prev_states, D, z = inputs
+        (out, out_x_saved, B_saved, C_saved, CB_saved, x_saved,
+         dt_saved, dA_cumsum_saved, prev_states_saved, D_saved, z_saved) = output
+        # Conditional save: use out if z is None, else use out_x
+        out_for_backward = out.view_as(out) if z is None else out_x_saved
+        ctx.save_for_backward(out_for_backward, B_saved, C_saved, CB_saved, x_saved,
+                              dt_saved, dA_cumsum_saved, prev_states_saved, D_saved, z_saved)
+        ctx.has_z = z is not None
+        ctx.has_D = D is not None
+
+    @staticmethod
+    def backward(ctx, dout, *_):
         if dout.stride(-1) != 1:
             dout = dout.contiguous()
         out, B, C, CB, x, dt, dA_cumsum, prev_states, D, z = ctx.saved_tensors
@@ -1745,7 +1763,7 @@ class ChunkScanFn(torch.autograd.Function):
         _, _, nchunks, chunk_size = dt.shape
         _, _, ngroups, dstate = B.shape
         assert dout.shape == (batch, seqlen, nheads, headdim)
-        if z is not None:
+        if ctx.has_z:
             dz, dout, dD, ddA_cumsum = _chunk_scan_bwd_dz(x, z, out, dout, chunk_size=chunk_size, D=D)
         else:
             dz = None
@@ -1759,12 +1777,120 @@ class ChunkScanFn(torch.autograd.Function):
         dx, ddt = _chunk_scan_bwd_dx(CB, x, dt, dA_cumsum, dout, D=D)
         # Formula for ddA_cumsum, assuming out is the output of the forward pass before adding x * D.
         # ddA_cumsum = torch.einsum("bclhp,bclhp->bhcl", out.float(), dout.float()) - ddt * dt
-        if z is not None:
+        if ctx.has_z:
             ddA_cumsum -= ddt * dt
         else: # If z is not None, we already calculated ddA_cumsum and dD when computing dz
             ddA_cumsum, dD = _chunk_scan_bwd_ddAcs_unstable(x, dt, out, dout, ddt, D=D)
         ddA_cumsum = ddA_cumsum.to(dA_cumsum.dtype)
         return dB, dC, dx, ddt, ddA_cumsum, dprev_states, dD, dz
+
+    @staticmethod
+    def vmap(info, in_dims, B, C, x, dt, dA_cumsum, prev_states, D, z):
+        # Handle vmap by moving batch dim to front and merging with existing batch
+        def move_bdim_to_front(tensor, bdim):
+            if tensor is None or bdim is None:
+                return tensor
+            return tensor.movedim(bdim, 0)
+
+        # Get vmap batch size from first batched input
+        vmap_batch_size = None
+        for tensor, bdim in zip([B, C, x, dt, dA_cumsum, prev_states], in_dims[:6]):
+            if bdim is not None and tensor is not None:
+                vmap_batch_size = tensor.shape[bdim]
+                break
+
+        # Move batch dims to front
+        B_batched = move_bdim_to_front(B, in_dims[0])
+        C_batched = move_bdim_to_front(C, in_dims[1])
+        x_batched = move_bdim_to_front(x, in_dims[2])
+        dt_batched = move_bdim_to_front(dt, in_dims[3])
+        dA_cumsum_batched = move_bdim_to_front(dA_cumsum, in_dims[4])
+        prev_states_batched = move_bdim_to_front(prev_states, in_dims[5])
+        D_batched = move_bdim_to_front(D, in_dims[6])
+        z_batched = move_bdim_to_front(z, in_dims[7])
+
+        # Broadcast non-batched inputs (except D which is shared across batch)
+        if in_dims[0] is None:
+            B_batched = B_batched.unsqueeze(0).expand(vmap_batch_size, *B_batched.shape)
+        if in_dims[1] is None:
+            C_batched = C_batched.unsqueeze(0).expand(vmap_batch_size, *C_batched.shape)
+        if in_dims[2] is None:
+            x_batched = x_batched.unsqueeze(0).expand(vmap_batch_size, *x_batched.shape)
+        if in_dims[3] is None:
+            dt_batched = dt_batched.unsqueeze(0).expand(vmap_batch_size, *dt_batched.shape)
+        if in_dims[4] is None:
+            dA_cumsum_batched = dA_cumsum_batched.unsqueeze(0).expand(vmap_batch_size, *dA_cumsum_batched.shape)
+        if in_dims[5] is None:
+            prev_states_batched = prev_states_batched.unsqueeze(0).expand(vmap_batch_size, *prev_states_batched.shape)
+        # Note: D is NOT broadcasted - it's shared across all batches (nheads, headdim) or (nheads,)
+        if z is not None and in_dims[7] is None:
+            z_batched = z_batched.unsqueeze(0).expand(vmap_batch_size, *z_batched.shape)
+
+        # Merge vmap batch dim with tensor batch dim
+        # B: (vmap_batch, batch, seqlen, ngroups, dstate) -> (vmap_batch * batch, seqlen, ngroups, dstate)
+        B_shape = B_batched.shape
+        B_merged = B_batched.reshape(B_shape[0] * B_shape[1], *B_shape[2:])
+
+        C_shape = C_batched.shape
+        C_merged = C_batched.reshape(C_shape[0] * C_shape[1], *C_shape[2:])
+
+        # x: (vmap_batch, batch, seqlen, nheads, headdim) -> (vmap_batch * batch, seqlen, nheads, headdim)
+        x_shape = x_batched.shape
+        x_merged = x_batched.reshape(x_shape[0] * x_shape[1], *x_shape[2:])
+
+        # dt: (vmap_batch, batch, nheads, nchunks, chunk_size) -> (vmap_batch * batch, nheads, nchunks, chunk_size)
+        dt_shape = dt_batched.shape
+        dt_merged = dt_batched.reshape(dt_shape[0] * dt_shape[1], *dt_shape[2:])
+
+        dA_cumsum_shape = dA_cumsum_batched.shape
+        dA_cumsum_merged = dA_cumsum_batched.reshape(dA_cumsum_shape[0] * dA_cumsum_shape[1], *dA_cumsum_shape[2:])
+
+        # prev_states: (vmap_batch, batch, nchunks, nheads, headdim, dstate)
+        prev_states_shape = prev_states_batched.shape
+        prev_states_merged = prev_states_batched.reshape(prev_states_shape[0] * prev_states_shape[1], *prev_states_shape[2:])
+
+        # D: optional, (nheads, headdim) or (nheads) - D is typically shared (not batched)
+        # When batched, all batch elements should have the same D, so we take the first
+        D_merged = None
+        if D is not None:
+            if in_dims[6] is not None:
+                # D is batched - take first element since D should be same across batch
+                D_merged = D_batched[0]
+            else:
+                # D is not batched - pass directly
+                D_merged = D
+
+        # z: optional, (vmap_batch, batch, seqlen, nheads, headdim)
+        z_merged = None
+        if z_batched is not None:
+            z_shape = z_batched.shape
+            z_merged = z_batched.reshape(z_shape[0] * z_shape[1], *z_shape[2:])
+
+        # Call the function with merged batches
+        result = ChunkScanFn.apply(B_merged, C_merged, x_merged, dt_merged,
+                                   dA_cumsum_merged, prev_states_merged, D_merged, z_merged)
+
+        # Unmerge outputs
+        merged_batch = result[0].shape[0]
+        original_batch = merged_batch // vmap_batch_size
+
+        # Unmerge all outputs - special handling for D (index 9) which is shared
+        # Output indices: 0=out, 1=out_x, 2=B, 3=C, 4=CB, 5=x, 6=dt, 7=dA_cumsum, 8=prev_states, 9=D, 10=z
+        outputs_unmerged = []
+        out_dims_list = []
+        for idx, out in enumerate(result):
+            if out is None:
+                outputs_unmerged.append(None)
+                out_dims_list.append(None)
+            elif idx == 9:  # D is shared (not batched), don't reshape
+                outputs_unmerged.append(out)
+                out_dims_list.append(None)  # D has no vmap batch dim
+            else:
+                out_unmerged = out.reshape(vmap_batch_size, original_batch, *out.shape[1:])
+                outputs_unmerged.append(out_unmerged)
+                out_dims_list.append(0)
+
+        return tuple(outputs_unmerged), tuple(out_dims_list)
 
 
 def chunk_scan(B, C, x, dt, dA_cumsum, prev_states, D=None, z=None):
@@ -1782,7 +1908,8 @@ def chunk_scan(B, C, x, dt, dA_cumsum, prev_states, D=None, z=None):
     Return:
         out: (batch, seqlen, nheads, headdim)
     """
-    return ChunkScanFn.apply(B, C, x, dt, dA_cumsum, prev_states, D, z)
+    result = ChunkScanFn.apply(B, C, x, dt, dA_cumsum, prev_states, D, z)
+    return result[0]  # Extract only user-facing output (out)
 
 
 def chunk_scan_ref(B, C, x, dt, dA_cumsum, prev_states, D=None, z=None):

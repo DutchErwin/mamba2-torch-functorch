@@ -338,7 +338,7 @@ def _layer_norm_bwd(dy, x, weight, bias, eps, mean, rstd, z=None, group_size=Non
 class LayerNormFn(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True,
+    def forward(x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True,
                 is_rms_norm=False):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))
         """
@@ -357,17 +357,57 @@ class LayerNormFn(torch.autograd.Function):
         if bias is not None:
             bias = bias.contiguous()
         y, mean, rstd = _layer_norm_fwd(x, weight, bias, eps, z=z, group_size=group_size, norm_before_gate=norm_before_gate, is_rms_norm=is_rms_norm)
-        ctx.save_for_backward(x, weight, bias, mean, rstd, z)
+        # Return output and views of tensors needed for backward
+        # (PyTorch requires views, not the original tensors, when using setup_context)
+        return (
+            y.reshape(x_shape_og),
+            x.view_as(x),
+            weight.view_as(weight),
+            bias.view_as(bias) if bias is not None else None,
+            mean,  # mean is newly created, no need for view_as
+            rstd,  # rstd is newly created, no need for view_as
+            z.view_as(z) if z is not None else None,
+            x_shape_og,  # Pass shape as part of output (will be unpacked in setup_context)
+        )
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm = inputs
+        y, x_saved, weight_saved, bias_saved, mean, rstd, z_saved, x_shape_og = output
+        # Save tensors (handle None values)
+        if bias_saved is not None and z_saved is not None:
+            ctx.save_for_backward(x_saved, weight_saved, bias_saved, mean, rstd, z_saved)
+        elif bias_saved is not None:
+            ctx.save_for_backward(x_saved, weight_saved, bias_saved, mean, rstd)
+        elif z_saved is not None:
+            ctx.save_for_backward(x_saved, weight_saved, mean, rstd, z_saved)
+        else:
+            ctx.save_for_backward(x_saved, weight_saved, mean, rstd)
+        ctx.has_bias = bias_saved is not None
+        ctx.has_z = z_saved is not None
         ctx.x_shape_og = x_shape_og
         ctx.eps = eps
         ctx.group_size = group_size
         ctx.norm_before_gate = norm_before_gate
         ctx.is_rms_norm = is_rms_norm
-        return y.reshape(x_shape_og)
 
     @staticmethod
-    def backward(ctx, dy):
-        x, weight, bias, mean, rstd, z = ctx.saved_tensors
+    def backward(ctx, dy, *_):
+        # Unpack saved tensors based on what was saved
+        saved = ctx.saved_tensors
+        if ctx.has_bias and ctx.has_z:
+            x, weight, bias, mean, rstd, z = saved
+        elif ctx.has_bias:
+            x, weight, bias, mean, rstd = saved
+            z = None
+        elif ctx.has_z:
+            x, weight, mean, rstd, z = saved
+            bias = None
+        else:
+            x, weight, mean, rstd = saved
+            bias = None
+            z = None
+
         dy = dy.reshape(-1, dy.shape[-1])
         if dy.stride(-1) != 1:
             dy = dy.contiguous()
@@ -376,13 +416,141 @@ class LayerNormFn(torch.autograd.Function):
                                          ctx.norm_before_gate, ctx.is_rms_norm)
         return dx.reshape(ctx.x_shape_og), dw, db, dz.reshape(ctx.x_shape_og) if dz is not None else None, None, None, None, None
 
+    @staticmethod
+    def vmap(info, in_dims, x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm):
+        # Handle vmap by moving batch dim to front and merging with existing batch
+        def move_bdim_to_front(tensor, bdim):
+            if bdim is None or tensor is None:
+                return tensor
+            return tensor.movedim(bdim, 0)
+
+        # Get vmap batch size from first batched input
+        vmap_batch_size = None
+        for tensor, bdim in zip([x, weight, bias, z], in_dims[:4]):
+            if bdim is not None and tensor is not None:
+                vmap_batch_size = tensor.shape[bdim]
+                break
+
+        # Move batch dims to front
+        x_batched = move_bdim_to_front(x, in_dims[0])
+        weight_batched = move_bdim_to_front(weight, in_dims[1])
+        bias_batched = move_bdim_to_front(bias, in_dims[2]) if bias is not None else None
+        z_batched = move_bdim_to_front(z, in_dims[3]) if z is not None else None
+
+        # For x, merge vmap batch with tensor's leading dims
+        # x: (..., hidden_size) - can have any leading dims
+        # After vmap: (vmap_batch, ..., hidden_size)
+        if in_dims[0] is None:
+            # x not batched, broadcast by adding vmap_batch dim
+            x_batched = x_batched.unsqueeze(0).expand(vmap_batch_size, *x_batched.shape)
+
+        # Merge vmap batch into first dimension
+        # x: (vmap_batch, batch, ..., hidden_size) -> (vmap_batch * batch, ..., hidden_size)
+        x_shape = x_batched.shape
+        x_merged = x_batched.reshape(x_shape[0] * x_shape[1], *x_shape[2:])
+
+        # Handle z similarly if present
+        z_merged = None
+        if z_batched is not None:
+            if in_dims[3] is None:
+                z_batched = z_batched.unsqueeze(0).expand(vmap_batch_size, *z_batched.shape)
+            z_shape = z_batched.shape
+            z_merged = z_batched.reshape(z_shape[0] * z_shape[1], *z_shape[2:])
+
+        # weight and bias are typically not batched (shared across batch)
+        # but handle the case if they are
+        if in_dims[1] is not None:
+            # weight is batched - this is unusual but handle it
+            weight_shape = weight_batched.shape
+            weight_merged = weight_batched.reshape(weight_shape[0] * weight_shape[1], *weight_shape[2:])
+        else:
+            weight_merged = weight_batched
+
+        if bias_batched is not None:
+            if in_dims[2] is not None:
+                bias_shape = bias_batched.shape
+                bias_merged = bias_batched.reshape(bias_shape[0] * bias_shape[1], *bias_shape[2:])
+            else:
+                bias_merged = bias_batched
+        else:
+            bias_merged = None
+
+        # Call the function with merged batches
+        result = LayerNormFn.apply(
+            x_merged, weight_merged, bias_merged, z_merged, eps, group_size, norm_before_gate, is_rms_norm
+        )
+
+        # Unpack result
+        y, x_out, weight_out, bias_out, mean_out, rstd_out, z_out, x_shape_og = result
+
+        # Unmerge y: shape is (vmap_batch * batch, ..., hidden_size)
+        # -> (vmap_batch, batch, ..., hidden_size)
+        merged_batch = y.shape[0]
+        original_batch = merged_batch // vmap_batch_size
+        y_unmerged = y.reshape(vmap_batch_size, original_batch, *y.shape[1:])
+
+        # x_out is 2D (M, N) where M = total_elements / N, N = hidden_size
+        # It was flattened inside forward(). We need to unmerge along the M dimension.
+        # x_out shape: (vmap_batch * original_M, hidden_size)
+        # -> (vmap_batch, original_M, hidden_size)
+        original_M = x_out.shape[0] // vmap_batch_size
+        x_unmerged = x_out.reshape(vmap_batch_size, original_M, x_out.shape[-1])
+
+        # weight and bias outputs - these are not reshaped internally
+        if in_dims[1] is not None:
+            weight_unmerged = weight_out.reshape(vmap_batch_size, -1)
+        else:
+            weight_unmerged = weight_out
+
+        if bias_out is not None:
+            if in_dims[2] is not None:
+                bias_unmerged = bias_out.reshape(vmap_batch_size, -1)
+            else:
+                bias_unmerged = bias_out
+        else:
+            bias_unmerged = None
+
+        # mean and rstd - these are 1D tensors of shape (ngroups * M,)
+        # For simplicity, unmerge along the first dimension
+        if mean_out is not None:
+            original_mean_size = mean_out.shape[0] // vmap_batch_size
+            mean_unmerged = mean_out.reshape(vmap_batch_size, original_mean_size)
+        else:
+            mean_unmerged = None
+        original_rstd_size = rstd_out.shape[0] // vmap_batch_size
+        rstd_unmerged = rstd_out.reshape(vmap_batch_size, original_rstd_size)
+
+        # z_out is also 2D if present, same treatment as x_out
+        if z_out is not None:
+            original_z_M = z_out.shape[0] // vmap_batch_size
+            z_unmerged = z_out.reshape(vmap_batch_size, original_z_M, z_out.shape[-1])
+        else:
+            z_unmerged = None
+
+        # Return (outputs, out_dims) - all outputs have vmap batch dim at position 0
+        # Outputs: (y, x, weight, bias, mean, rstd, z, x_shape_og)
+        out_dims = (
+            0,  # y
+            0,  # x
+            0 if in_dims[1] is not None else None,  # weight
+            0 if bias_out is not None and in_dims[2] is not None else None,  # bias
+            0 if mean_unmerged is not None else None,  # mean
+            0,  # rstd
+            0 if z_out is not None else None,  # z
+            None,  # x_shape_og (not a tensor)
+        )
+
+        return (y_unmerged, x_unmerged, weight_unmerged, bias_unmerged, mean_unmerged, rstd_unmerged, z_unmerged, x_shape_og), out_dims
+
 
 def layernorm_fn(x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True, is_rms_norm=False):
-    return LayerNormFn.apply(x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm)
+    result = LayerNormFn.apply(x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm)
+    return result[0]  # Extract only user-facing output (y)
 
 
 def rmsnorm_fn(x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True):
-    return LayerNormFn.apply(x, weight, bias, z, eps, group_size, norm_before_gate, True)
+    result = LayerNormFn.apply(x, weight, bias, z, eps, group_size, norm_before_gate, True)
+    return result[0]  # Extract only user-facing output (y)
 
 
 class LayerNorm(torch.nn.Module):

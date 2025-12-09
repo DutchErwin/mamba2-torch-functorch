@@ -525,22 +525,212 @@ def selective_scan_bwd(dout, x, dt, A, B, C, D=None, z=None):
 class MambaChunkScanCombinedFn(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, dt_softplus=False, dt_limit=(0.0, float("inf")), return_final_states=False):
-        ctx.dt_dtype = dt.dtype
+    def forward(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, dt_softplus=False, dt_limit=(0.0, float("inf")), return_final_states=False):
+        dt_dtype = dt.dtype
         out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=dt_softplus, dt_limit=dt_limit)
-        ctx.save_for_backward(out if z is None else out_x, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx)
+        # Return user-facing outputs first, then views of tensors needed for backward
+        # out_x is returned for conditional save logic in setup_context (use out if z is None, else out_x)
+        # (PyTorch requires views, not original tensors, when using setup_context)
+        return (out, final_states,
+                out_x.view_as(out_x) if out_x is not None else None,
+                x.view_as(x), dt.view_as(dt), dA_cumsum.view_as(dA_cumsum),
+                A.view_as(A), B.view_as(B), C.view_as(C),
+                D.view_as(D) if D is not None else None,
+                z.view_as(z) if z is not None else None,
+                dt_bias.view_as(dt_bias) if dt_bias is not None else None,
+                initial_states.view_as(initial_states) if initial_states is not None else None,
+                seq_idx.view_as(seq_idx) if seq_idx is not None else None,
+                dt_dtype, dt_softplus, chunk_size, dt_limit, return_final_states)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, dt_softplus, dt_limit, return_final_states = inputs
+        (out, final_states, out_x_saved, x_saved, dt_saved, dA_cumsum_saved,
+         A_saved, B_saved, C_saved, D_saved, z_saved, dt_bias_saved,
+         initial_states_saved, seq_idx_saved,
+         dt_dtype, _dt_softplus, _chunk_size, _dt_limit, _return_final_states) = output
+        # Conditional save: use out if z is None, else use out_x
+        out_for_backward = out.view_as(out) if z is None else out_x_saved
+        ctx.save_for_backward(out_for_backward, x_saved, dt_saved, dA_cumsum_saved,
+                              A_saved, B_saved, C_saved, D_saved, z_saved,
+                              dt_bias_saved, initial_states_saved, seq_idx_saved)
+        ctx.dt_dtype = dt_dtype
         ctx.dt_softplus = dt_softplus
         ctx.chunk_size = chunk_size
         ctx.dt_limit = dt_limit
         ctx.return_final_states = return_final_states
-        return out if not return_final_states else (out, final_states)
+        ctx.has_D = D is not None
+        ctx.has_z = z is not None
+        ctx.has_dt_bias = dt_bias is not None
+        ctx.has_initial_states = initial_states is not None
+        ctx.has_seq_idx = seq_idx is not None
 
     @staticmethod
-    def backward(ctx, dout, *args):
+    def backward(ctx, dout, dfinal_states, *_):
         out, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx = ctx.saved_tensors
-        dfinal_states = args[0] if ctx.return_final_states else None
-        dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=ctx.dt_softplus, dt_limit=ctx.dt_limit)
+        dfinal_states_for_bwd = dfinal_states if ctx.return_final_states else None
+        dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states_for_bwd, seq_idx=seq_idx, dt_softplus=ctx.dt_softplus, dt_limit=ctx.dt_limit)
         return dx, ddt, dA, dB, dC, None, dD, dz, ddt_bias, dinitial_states, None, None, None, None
+
+    @staticmethod
+    def vmap(info, in_dims, x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, dt_softplus, dt_limit, return_final_states):
+        # Handle vmap by moving batch dim to front and merging with existing batch
+        def move_bdim_to_front(tensor, bdim):
+            if tensor is None or bdim is None:
+                return tensor
+            return tensor.movedim(bdim, 0)
+
+        # in_dims order: x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, dt_softplus, dt_limit, return_final_states
+        # Tensor inputs: x(0), dt(1), A(2), B(3), C(4), D(6), z(7), dt_bias(8), initial_states(9), seq_idx(10)
+        # Non-tensor inputs: chunk_size(5), dt_softplus(11), dt_limit(12), return_final_states(13)
+
+        # Get vmap batch size from first batched tensor input
+        vmap_batch_size = None
+        tensor_indices = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10]  # indices of tensor inputs
+        tensors = [x, dt, A, B, C, D, z, dt_bias, initial_states, seq_idx]
+        for i, tensor_idx in enumerate(tensor_indices):
+            bdim = in_dims[tensor_idx]
+            tensor = tensors[i]
+            if bdim is not None and tensor is not None:
+                vmap_batch_size = tensor.shape[bdim]
+                break
+
+        if vmap_batch_size is None:
+            # No batched inputs, just call directly
+            result = MambaChunkScanCombinedFn.apply(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, dt_softplus, dt_limit, return_final_states)
+            # Return None for all output dims since no batching
+            return result, (None,) * len(result)
+
+        # Move batch dims to front
+        x_batched = move_bdim_to_front(x, in_dims[0])
+        dt_batched = move_bdim_to_front(dt, in_dims[1])
+        A_batched = move_bdim_to_front(A, in_dims[2])
+        B_batched = move_bdim_to_front(B, in_dims[3])
+        C_batched = move_bdim_to_front(C, in_dims[4])
+        D_batched = move_bdim_to_front(D, in_dims[6])
+        z_batched = move_bdim_to_front(z, in_dims[7])
+        dt_bias_batched = move_bdim_to_front(dt_bias, in_dims[8])
+        initial_states_batched = move_bdim_to_front(initial_states, in_dims[9])
+        seq_idx_batched = move_bdim_to_front(seq_idx, in_dims[10])
+
+        # Broadcast non-batched inputs (expand to vmap_batch_size)
+        # x: (batch, seqlen, nheads, headdim)
+        if in_dims[0] is None:
+            x_batched = x_batched.unsqueeze(0).expand(vmap_batch_size, *x_batched.shape)
+        # dt: (batch, seqlen, nheads)
+        if in_dims[1] is None:
+            dt_batched = dt_batched.unsqueeze(0).expand(vmap_batch_size, *dt_batched.shape)
+        # A: (nheads,) - typically shared, don't broadcast
+        # B: (batch, seqlen, ngroups, dstate)
+        if in_dims[3] is None:
+            B_batched = B_batched.unsqueeze(0).expand(vmap_batch_size, *B_batched.shape)
+        # C: (batch, seqlen, ngroups, dstate)
+        if in_dims[4] is None:
+            C_batched = C_batched.unsqueeze(0).expand(vmap_batch_size, *C_batched.shape)
+        # D: (nheads, headdim) or (nheads,) - typically shared
+        # z: optional, (batch, seqlen, nheads, headdim)
+        if z is not None and in_dims[7] is None:
+            z_batched = z_batched.unsqueeze(0).expand(vmap_batch_size, *z_batched.shape)
+        # dt_bias: (nheads,) - typically shared
+        # initial_states: optional, (batch, nheads, headdim, dstate)
+        if initial_states is not None and in_dims[9] is None:
+            initial_states_batched = initial_states_batched.unsqueeze(0).expand(vmap_batch_size, *initial_states_batched.shape)
+        # seq_idx: optional, (batch, seqlen)
+        if seq_idx is not None and in_dims[10] is None:
+            seq_idx_batched = seq_idx_batched.unsqueeze(0).expand(vmap_batch_size, *seq_idx_batched.shape)
+
+        # Merge vmap batch dim with tensor batch dim
+        # x: (vmap_batch, batch, seqlen, nheads, headdim) -> (vmap_batch * batch, seqlen, nheads, headdim)
+        x_shape = x_batched.shape
+        x_merged = x_batched.reshape(x_shape[0] * x_shape[1], *x_shape[2:])
+
+        # dt: (vmap_batch, batch, seqlen, nheads) -> (vmap_batch * batch, seqlen, nheads)
+        dt_shape = dt_batched.shape
+        dt_merged = dt_batched.reshape(dt_shape[0] * dt_shape[1], *dt_shape[2:])
+
+        # A: (nheads,) - shared, use directly or take first if batched
+        if in_dims[2] is not None:
+            A_merged = A_batched[0]
+        else:
+            A_merged = A
+
+        # B: (vmap_batch, batch, seqlen, ngroups, dstate) -> (vmap_batch * batch, seqlen, ngroups, dstate)
+        B_shape = B_batched.shape
+        B_merged = B_batched.reshape(B_shape[0] * B_shape[1], *B_shape[2:])
+
+        # C: (vmap_batch, batch, seqlen, ngroups, dstate) -> (vmap_batch * batch, seqlen, ngroups, dstate)
+        C_shape = C_batched.shape
+        C_merged = C_batched.reshape(C_shape[0] * C_shape[1], *C_shape[2:])
+
+        # D: (nheads, headdim) or (nheads,) - shared, use directly or take first if batched
+        D_merged = None
+        if D is not None:
+            if in_dims[6] is not None:
+                D_merged = D_batched[0]
+            else:
+                D_merged = D
+
+        # z: optional, (vmap_batch, batch, seqlen, nheads, headdim) -> (vmap_batch * batch, seqlen, nheads, headdim)
+        z_merged = None
+        if z_batched is not None:
+            z_shape = z_batched.shape
+            z_merged = z_batched.reshape(z_shape[0] * z_shape[1], *z_shape[2:])
+
+        # dt_bias: (nheads,) - shared, use directly or take first if batched
+        dt_bias_merged = None
+        if dt_bias is not None:
+            if in_dims[8] is not None:
+                dt_bias_merged = dt_bias_batched[0]
+            else:
+                dt_bias_merged = dt_bias
+
+        # initial_states: optional, (vmap_batch, batch, nheads, headdim, dstate) -> (vmap_batch * batch, nheads, headdim, dstate)
+        initial_states_merged = None
+        if initial_states_batched is not None:
+            is_shape = initial_states_batched.shape
+            initial_states_merged = initial_states_batched.reshape(is_shape[0] * is_shape[1], *is_shape[2:])
+
+        # seq_idx: optional, (vmap_batch, batch, seqlen) -> (vmap_batch * batch, seqlen)
+        seq_idx_merged = None
+        if seq_idx_batched is not None:
+            si_shape = seq_idx_batched.shape
+            seq_idx_merged = seq_idx_batched.reshape(si_shape[0] * si_shape[1], *si_shape[2:])
+
+        # Call the function with merged batches
+        result = MambaChunkScanCombinedFn.apply(
+            x_merged, dt_merged, A_merged, B_merged, C_merged, chunk_size,
+            D_merged, z_merged, dt_bias_merged, initial_states_merged, seq_idx_merged,
+            dt_softplus, dt_limit, return_final_states
+        )
+
+        # Unmerge outputs
+        # Output structure: (out, final_states, out_x, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx, dt_dtype, dt_softplus, chunk_size, dt_limit, return_final_states)
+        merged_batch = result[0].shape[0]
+        original_batch = merged_batch // vmap_batch_size
+
+        outputs_unmerged = []
+        out_dims_list = []
+
+        for idx, out in enumerate(result):
+            if out is None:
+                outputs_unmerged.append(None)
+                out_dims_list.append(None)
+            elif idx in [6, 9, 11]:  # A, D, dt_bias are shared (not batched)
+                outputs_unmerged.append(out)
+                out_dims_list.append(None)
+            elif idx >= 14:  # Non-tensor outputs: dt_dtype, dt_softplus, chunk_size, dt_limit, return_final_states
+                outputs_unmerged.append(out)
+                out_dims_list.append(None)
+            elif isinstance(out, torch.Tensor) and out.dim() > 0:
+                # Tensor outputs that need unmerging
+                out_unmerged = out.reshape(vmap_batch_size, original_batch, *out.shape[1:])
+                outputs_unmerged.append(out_unmerged)
+                out_dims_list.append(0)
+            else:
+                outputs_unmerged.append(out)
+                out_dims_list.append(None)
+
+        return tuple(outputs_unmerged), tuple(out_dims_list)
 
 
 def mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, dt_softplus=False, dt_limit=(0.0, float("inf")), return_final_states=False):
@@ -560,8 +750,15 @@ def mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bia
         dt_softplus: Whether to apply softplus to dt
     Return:
         out: (batch, seqlen, nheads, headdim)
+        or (out, final_states) if return_final_states is True
     """
-    return MambaChunkScanCombinedFn.apply(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, dt_softplus, dt_limit, return_final_states)
+    result = MambaChunkScanCombinedFn.apply(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, dt_softplus, dt_limit, return_final_states)
+    # Extract user-facing outputs: result[0] is out, result[1] is final_states
+    out, final_states = result[0], result[1]
+    if return_final_states:
+        return out, final_states
+    else:
+        return out
 
 
 def mamba_chunk_scan(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, dt_softplus=False):
@@ -741,7 +938,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
 
     @staticmethod
     @custom_fwd
-    def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu",
+    def forward(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu",
                 rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None,
                 ngroups=1, norm_before_gate=True):
         assert activation in [None, "silu", "swish"]
@@ -796,7 +993,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
                 out = rearrange(out, "(b s) d -> b s d", b=batch)
             else:
                 out = out01
-        ctx.outproj_weight_dtype = outproj_weight.dtype if outproj_weight is not None else None
+        outproj_weight_dtype = outproj_weight.dtype if outproj_weight is not None else None
         if outproj_weight is not None:
             if torch.is_autocast_enabled():
                 dtype = torch.get_autocast_gpu_dtype()
@@ -805,8 +1002,39 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             out = F.linear(out, outproj_weight, outproj_bias)
         else:
             assert outproj_bias is None
-        ctx.save_for_backward(zxbcdt, conv1d_weight, conv1d_bias,
-                              out_x, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias)
+        # Return user-facing outputs first, then views of tensors needed for backward
+        # (PyTorch requires views, not original tensors, when using setup_context)
+        return (out, final_states,
+                out_x.view_as(out_x),
+                zxbcdt.view_as(zxbcdt), conv1d_weight.view_as(conv1d_weight), conv1d_bias.view_as(conv1d_bias),
+                A.view_as(A), D.view_as(D), dt_bias.view_as(dt_bias),
+                initial_states.view_as(initial_states) if initial_states is not None else None,
+                seq_idx.view_as(seq_idx) if seq_idx is not None else None,
+                rmsnorm_weight.view_as(rmsnorm_weight) if rmsnorm_weight is not None else None,
+                rstd.view_as(rstd) if rstd is not None else None,
+                outproj_weight.view_as(outproj_weight) if outproj_weight is not None else None,
+                outproj_bias.view_as(outproj_bias) if outproj_bias is not None else None,
+                # Non-tensor context attributes
+                outproj_weight_dtype, dt_limit, return_final_states, activation,
+                rmsnorm_eps, norm_before_gate, chunk_size, headdim, ngroups)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        (zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx,
+         dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps,
+         outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate) = inputs
+        (out, final_states, out_x_saved, zxbcdt_saved, conv1d_weight_saved, conv1d_bias_saved,
+         A_saved, D_saved, dt_bias_saved, initial_states_saved, seq_idx_saved,
+         rmsnorm_weight_saved, rstd_saved, outproj_weight_saved, outproj_bias_saved,
+         outproj_weight_dtype, _dt_limit, _return_final_states, _activation,
+         _rmsnorm_eps, _norm_before_gate, _chunk_size, _headdim, _ngroups) = output
+
+        ctx.save_for_backward(zxbcdt_saved, conv1d_weight_saved, conv1d_bias_saved,
+                              out_x_saved, A_saved, D_saved, dt_bias_saved,
+                              initial_states_saved, seq_idx_saved,
+                              rmsnorm_weight_saved, rstd_saved,
+                              outproj_weight_saved, outproj_bias_saved)
+        ctx.outproj_weight_dtype = outproj_weight_dtype
         ctx.dt_limit = dt_limit
         ctx.return_final_states = return_final_states
         ctx.activation = activation
@@ -815,13 +1043,21 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         ctx.chunk_size = chunk_size
         ctx.headdim = headdim
         ctx.ngroups = ngroups
-        return out if not return_final_states else (out, final_states)
+        # Required for @custom_bwd compatibility when using setup_context pattern
+        ctx._fwd_used_autocast = torch.is_autocast_enabled()
+        ctx._dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else None
+        # Track which optional tensors are present
+        ctx.has_initial_states = initial_states is not None
+        ctx.has_seq_idx = seq_idx is not None
+        ctx.has_rmsnorm_weight = rmsnorm_weight is not None
+        ctx.has_outproj_weight = outproj_weight is not None
+        ctx.has_outproj_bias = outproj_bias is not None
 
     @staticmethod
     @custom_bwd
-    def backward(ctx, dout, *args):
+    def backward(ctx, dout, dfinal_states, *_):
         zxbcdt, conv1d_weight, conv1d_bias, out, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias = ctx.saved_tensors
-        dfinal_states = args[0] if ctx.return_final_states else None
+        dfinal_states_for_bwd = dfinal_states if ctx.return_final_states else None
         headdim = ctx.headdim
         nheads = D.shape[0]
         dim = nheads * headdim
@@ -862,7 +1098,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         if rmsnorm_weight is None:
             dz = rearrange(dz, "b l (h p) -> b l h p", h=nheads)
             dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states, *rest = _mamba_chunk_scan_combined_bwd(
-                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC, dz=dz, recompute_output=recompute_output
+                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states_for_bwd, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC, dz=dz, recompute_output=recompute_output
             )
             out_for_linear = rearrange(rest[0], "b s h p -> b s (h p)") if recompute_output else None
             drmsnorm_weight = None
@@ -877,7 +1113,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             out_for_linear = out_recompute if recompute_output else None
             dout = rearrange(dout, "(b s) (h p) -> b s h p", b=batch, p=headdim)
             dx, ddt, dA, dB, dC, dD, _, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(
-                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC
+                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states_for_bwd, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC
             )
 
         if outproj_weight is not None:
@@ -892,6 +1128,158 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         )
         dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
         return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None
+
+    @staticmethod
+    def vmap(info, in_dims, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size,
+             initial_states, seq_idx, dt_limit, return_final_states, activation,
+             rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate):
+        # Handle vmap by moving batch dim to front and merging with existing batch
+        def move_bdim_to_front(tensor, bdim):
+            if tensor is None or bdim is None:
+                return tensor
+            return tensor.movedim(bdim, 0)
+
+        # in_dims order: zxbcdt(0), conv1d_weight(1), conv1d_bias(2), dt_bias(3), A(4), D(5), chunk_size(6),
+        #                initial_states(7), seq_idx(8), dt_limit(9), return_final_states(10), activation(11),
+        #                rmsnorm_weight(12), rmsnorm_eps(13), outproj_weight(14), outproj_bias(15),
+        #                headdim(16), ngroups(17), norm_before_gate(18)
+        # Tensor inputs: zxbcdt(0), conv1d_weight(1), conv1d_bias(2), dt_bias(3), A(4), D(5),
+        #                initial_states(7), seq_idx(8), rmsnorm_weight(12), outproj_weight(14), outproj_bias(15)
+
+        # Get vmap batch size from first batched tensor input
+        vmap_batch_size = None
+        tensor_indices = [0, 1, 2, 3, 4, 5, 7, 8, 12, 14, 15]
+        tensors = [zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D,
+                   initial_states, seq_idx, rmsnorm_weight, outproj_weight, outproj_bias]
+        for i, tensor_idx in enumerate(tensor_indices):
+            bdim = in_dims[tensor_idx]
+            tensor = tensors[i]
+            if bdim is not None and tensor is not None:
+                vmap_batch_size = tensor.shape[bdim]
+                break
+
+        if vmap_batch_size is None:
+            # No batched inputs, just call directly
+            result = MambaSplitConv1dScanCombinedFn.apply(
+                zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size,
+                initial_states, seq_idx, dt_limit, return_final_states, activation,
+                rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate
+            )
+            # Return None for all output dims since no batching
+            return result, (None,) * len(result)
+
+        # Move batch dims to front
+        zxbcdt_batched = move_bdim_to_front(zxbcdt, in_dims[0])
+        conv1d_weight_batched = move_bdim_to_front(conv1d_weight, in_dims[1])
+        conv1d_bias_batched = move_bdim_to_front(conv1d_bias, in_dims[2])
+        dt_bias_batched = move_bdim_to_front(dt_bias, in_dims[3])
+        A_batched = move_bdim_to_front(A, in_dims[4])
+        D_batched = move_bdim_to_front(D, in_dims[5])
+        initial_states_batched = move_bdim_to_front(initial_states, in_dims[7])
+        seq_idx_batched = move_bdim_to_front(seq_idx, in_dims[8])
+        rmsnorm_weight_batched = move_bdim_to_front(rmsnorm_weight, in_dims[12])
+        outproj_weight_batched = move_bdim_to_front(outproj_weight, in_dims[14])
+        outproj_bias_batched = move_bdim_to_front(outproj_bias, in_dims[15])
+
+        # Broadcast non-batched inputs (expand to vmap_batch_size)
+        # zxbcdt: (batch, seqlen, input_dim)
+        if in_dims[0] is None:
+            zxbcdt_batched = zxbcdt_batched.unsqueeze(0).expand(vmap_batch_size, *zxbcdt_batched.shape)
+        # initial_states: optional, (batch, nheads, headdim, dstate)
+        if initial_states is not None and in_dims[7] is None:
+            initial_states_batched = initial_states_batched.unsqueeze(0).expand(vmap_batch_size, *initial_states_batched.shape)
+        # seq_idx: optional, (batch, seqlen)
+        if seq_idx is not None and in_dims[8] is None:
+            seq_idx_batched = seq_idx_batched.unsqueeze(0).expand(vmap_batch_size, *seq_idx_batched.shape)
+
+        # Merge vmap batch dim with tensor batch dim
+        # zxbcdt: (vmap_batch, batch, seqlen, input_dim) -> (vmap_batch * batch, seqlen, input_dim)
+        zxbcdt_shape = zxbcdt_batched.shape
+        zxbcdt_merged = zxbcdt_batched.reshape(zxbcdt_shape[0] * zxbcdt_shape[1], *zxbcdt_shape[2:])
+
+        # Shared parameters - use directly or take first if batched
+        # conv1d_weight: (dim + 2 * ngroups * dstate, width) - typically shared
+        conv1d_weight_merged = conv1d_weight_batched[0] if in_dims[1] is not None else conv1d_weight
+        # conv1d_bias: (dim + 2 * ngroups * dstate,) - typically shared
+        conv1d_bias_merged = conv1d_bias_batched[0] if in_dims[2] is not None else conv1d_bias
+        # dt_bias: (nheads,) - typically shared
+        dt_bias_merged = dt_bias_batched[0] if in_dims[3] is not None else dt_bias
+        # A: (nheads,) - typically shared
+        A_merged = A_batched[0] if in_dims[4] is not None else A
+        # D: (nheads, headdim) or (nheads,) - typically shared
+        D_merged = D_batched[0] if in_dims[5] is not None else D
+
+        # initial_states: optional, (vmap_batch, batch, nheads, headdim, dstate) -> (vmap_batch * batch, nheads, headdim, dstate)
+        initial_states_merged = None
+        if initial_states_batched is not None:
+            is_shape = initial_states_batched.shape
+            initial_states_merged = initial_states_batched.reshape(is_shape[0] * is_shape[1], *is_shape[2:])
+
+        # seq_idx: optional, (vmap_batch, batch, seqlen) -> (vmap_batch * batch, seqlen)
+        seq_idx_merged = None
+        if seq_idx_batched is not None:
+            si_shape = seq_idx_batched.shape
+            seq_idx_merged = seq_idx_batched.reshape(si_shape[0] * si_shape[1], *si_shape[2:])
+
+        # rmsnorm_weight: optional, (dim,) - typically shared
+        rmsnorm_weight_merged = None
+        if rmsnorm_weight is not None:
+            rmsnorm_weight_merged = rmsnorm_weight_batched[0] if in_dims[12] is not None else rmsnorm_weight
+
+        # outproj_weight: optional, (out_dim, dim) - typically shared
+        outproj_weight_merged = None
+        if outproj_weight is not None:
+            outproj_weight_merged = outproj_weight_batched[0] if in_dims[14] is not None else outproj_weight
+
+        # outproj_bias: optional, (out_dim,) - typically shared
+        outproj_bias_merged = None
+        if outproj_bias is not None:
+            outproj_bias_merged = outproj_bias_batched[0] if in_dims[15] is not None else outproj_bias
+
+        # Call the function with merged batches
+        result = MambaSplitConv1dScanCombinedFn.apply(
+            zxbcdt_merged, conv1d_weight_merged, conv1d_bias_merged, dt_bias_merged,
+            A_merged, D_merged, chunk_size,
+            initial_states_merged, seq_idx_merged, dt_limit, return_final_states, activation,
+            rmsnorm_weight_merged, rmsnorm_eps, outproj_weight_merged, outproj_bias_merged,
+            headdim, ngroups, norm_before_gate
+        )
+
+        # Unmerge outputs
+        # Output structure: (out, final_states, out_x, zxbcdt, conv1d_weight, conv1d_bias,
+        #                    A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd,
+        #                    outproj_weight, outproj_bias,
+        #                    outproj_weight_dtype, dt_limit, return_final_states, activation,
+        #                    rmsnorm_eps, norm_before_gate, chunk_size, headdim, ngroups)
+        merged_batch = result[0].shape[0]
+        original_batch = merged_batch // vmap_batch_size
+
+        outputs_unmerged = []
+        out_dims_list = []
+
+        # Indices of shared parameters that shouldn't be unmerged
+        shared_indices = [4, 5, 6, 7, 8, 11, 13, 14]  # conv1d_weight, conv1d_bias, A, D, dt_bias, rmsnorm_weight, outproj_weight, outproj_bias
+
+        for idx, out in enumerate(result):
+            if out is None:
+                outputs_unmerged.append(None)
+                out_dims_list.append(None)
+            elif idx in shared_indices:  # Shared parameters (not batched)
+                outputs_unmerged.append(out)
+                out_dims_list.append(None)
+            elif idx >= 15:  # Non-tensor outputs: outproj_weight_dtype, dt_limit, return_final_states, etc.
+                outputs_unmerged.append(out)
+                out_dims_list.append(None)
+            elif isinstance(out, torch.Tensor) and out.dim() > 0:
+                # Tensor outputs that need unmerging
+                out_unmerged = out.reshape(vmap_batch_size, original_batch, *out.shape[1:])
+                outputs_unmerged.append(out_unmerged)
+                out_dims_list.append(0)
+            else:
+                outputs_unmerged.append(out)
+                out_dims_list.append(None)
+
+        return tuple(outputs_unmerged), tuple(out_dims_list)
 
 
 def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True):
@@ -912,8 +1300,15 @@ def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias
         norm_before_gate: if True, we do RMSNorm(x) * F.silu(z). If False, we do RMSNorm(x * F.silu(z))
     Return:
         out: (batch, seqlen, dim)
+        or (out, final_states) if return_final_states is True
     """
-    return MambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate)
+    result = MambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate)
+    # Extract user-facing outputs: result[0] is out, result[1] is final_states
+    out, final_states = result[0], result[1]
+    if return_final_states:
+        return out, final_states
+    else:
+        return out
 
 
 def mamba_split_conv1d_scan_ref(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, dt_limit=(0.0, float("inf")), activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True):

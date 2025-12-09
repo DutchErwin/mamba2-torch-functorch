@@ -284,18 +284,26 @@ def _state_passing_bwd(
 class StatePassingFn(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, states, dA_chunk_cumsum, initial_states=None):
+    def forward(states, dA_chunk_cumsum, initial_states=None):
         batch, nchunks, nheads, dim = states.shape
         assert dA_chunk_cumsum.shape == (batch, nheads, nchunks)
         if states.stride(-1) != 1:
             states = states.contiguous()
         out, final_states = _state_passing_fwd(states, dA_chunk_cumsum, initial_states)
-        ctx.save_for_backward(out, dA_chunk_cumsum)
-        ctx.has_initial_states = initial_states is not None
-        return out, final_states
+        has_initial_states = initial_states is not None
+        # Return user-facing outputs + tensors needed for backward (as views)
+        # PyTorch requires views, not original tensors, when using setup_context
+        return out, final_states, out.view_as(out), dA_chunk_cumsum.view_as(dA_chunk_cumsum), has_initial_states
 
     @staticmethod
-    def backward(ctx, dout, dfinal_states):
+    def setup_context(ctx, inputs, output):
+        states, dA_chunk_cumsum, initial_states = inputs
+        out, final_states, out_saved, dA_chunk_cumsum_saved, has_initial_states = output
+        ctx.save_for_backward(out_saved, dA_chunk_cumsum_saved)
+        ctx.has_initial_states = has_initial_states
+
+    @staticmethod
+    def backward(ctx, dout, dfinal_states, *_):
         out, dA_chunk_cumsum = ctx.saved_tensors
         batch, nchunks, nheads, dim = out.shape
         assert dout.shape == (batch, nchunks, nheads, dim)
@@ -308,6 +316,72 @@ class StatePassingFn(torch.autograd.Function):
         )
         return dstates, ddA_chunk_cumsum, dinitstates
 
+    @staticmethod
+    def vmap(info, in_dims, states, dA_chunk_cumsum, initial_states):
+        # Handle vmap by moving batch dim to front and merging with existing batch
+        def move_bdim_to_front(tensor, bdim):
+            if bdim is None or tensor is None:
+                return tensor
+            return tensor.movedim(bdim, 0)
+
+        # Get vmap batch size from first batched input
+        vmap_batch_size = None
+        for tensor, bdim in zip([states, dA_chunk_cumsum, initial_states], in_dims[:3]):
+            if bdim is not None and tensor is not None:
+                vmap_batch_size = tensor.shape[bdim]
+                break
+
+        # Move batch dims to front
+        states_batched = move_bdim_to_front(states, in_dims[0])
+        dA_chunk_cumsum_batched = move_bdim_to_front(dA_chunk_cumsum, in_dims[1])
+        initial_states_batched = move_bdim_to_front(initial_states, in_dims[2]) if initial_states is not None else None
+
+        # If some inputs are not batched, broadcast them
+        if in_dims[0] is None:
+            states_batched = states_batched.unsqueeze(0).expand(vmap_batch_size, *states_batched.shape)
+        if in_dims[1] is None:
+            dA_chunk_cumsum_batched = dA_chunk_cumsum_batched.unsqueeze(0).expand(vmap_batch_size, *dA_chunk_cumsum_batched.shape)
+        if initial_states is not None and in_dims[2] is None:
+            initial_states_batched = initial_states_batched.unsqueeze(0).expand(vmap_batch_size, *initial_states_batched.shape)
+
+        # Merge vmap batch dim with tensor batch dim
+        # states: (vmap_batch, batch, nchunks, nheads, dim) -> (vmap_batch * batch, nchunks, nheads, dim)
+        states_shape = states_batched.shape
+        states_merged = states_batched.reshape(states_shape[0] * states_shape[1], *states_shape[2:])
+
+        # dA_chunk_cumsum: (vmap_batch, batch, nheads, nchunks) -> (vmap_batch * batch, nheads, nchunks)
+        dA_cs_shape = dA_chunk_cumsum_batched.shape
+        dA_chunk_cumsum_merged = dA_chunk_cumsum_batched.reshape(dA_cs_shape[0] * dA_cs_shape[1], *dA_cs_shape[2:])
+
+        # initial_states: (vmap_batch, batch, nheads, dim) -> (vmap_batch * batch, nheads, dim)
+        if initial_states_batched is not None:
+            init_shape = initial_states_batched.shape
+            initial_states_merged = initial_states_batched.reshape(init_shape[0] * init_shape[1], *init_shape[2:])
+        else:
+            initial_states_merged = None
+
+        # Call the function with merged batches
+        out, final_states, out_saved, dA_cs_saved, has_initial_states = StatePassingFn.apply(
+            states_merged, dA_chunk_cumsum_merged, initial_states_merged
+        )
+
+        # Unmerge: out shape is (vmap_batch * batch, nchunks, nheads, dim)
+        # -> (vmap_batch, batch, nchunks, nheads, dim)
+        merged_batch = out.shape[0]
+        original_batch = merged_batch // vmap_batch_size
+        out_unmerged = out.reshape(vmap_batch_size, original_batch, *out.shape[1:])
+
+        # final_states: (vmap_batch * batch, nheads, dim) -> (vmap_batch, batch, nheads, dim)
+        final_states_unmerged = final_states.reshape(vmap_batch_size, original_batch, *final_states.shape[1:])
+
+        # Unmerge saved tensors
+        out_saved_unmerged = out_saved.reshape(vmap_batch_size, original_batch, *out_saved.shape[1:])
+        dA_cs_saved_unmerged = dA_cs_saved.reshape(vmap_batch_size, original_batch, *dA_cs_saved.shape[1:])
+
+        # Return (outputs, out_dims) - all outputs have vmap batch dim at position 0
+        # has_initial_states is a bool, not batched
+        return (out_unmerged, final_states_unmerged, out_saved_unmerged, dA_cs_saved_unmerged, has_initial_states), (0, 0, 0, 0, None)
+
 
 def state_passing(states, dA_chunk_cumsum, initial_states=None):
     """
@@ -319,7 +393,8 @@ def state_passing(states, dA_chunk_cumsum, initial_states=None):
         out: (batch, nchunks, nheads, dim)
         final_states: (batch, nheads, dim)
     """
-    return StatePassingFn.apply(states, dA_chunk_cumsum, initial_states)
+    result = StatePassingFn.apply(states, dA_chunk_cumsum, initial_states)
+    return result[0], result[1]  # Extract only user-facing outputs (out, final_states)
 
 
 def state_passing_ref(states, dA_chunk_cumsum, initial_states=None):
