@@ -320,3 +320,4 @@ pyrightconfig.json
 
 # local checkpoints that I've ported
 models/
+.claude/
