@@ -958,11 +958,10 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         assert A.shape == (nheads,)
         zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1)
         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
-        xBC_conv = rearrange(
-            causal_conv1d_cuda.causal_conv1d_fwd(rearrange(xBC, "b s d -> b d s"),
-                                                 conv1d_weight, conv1d_bias, seq_idx, None, None, activation in ["silu", "swish"]),
-            "b d s -> b s d"
-        )
+        xBC_t = rearrange(xBC, "b s d -> b d s").contiguous()
+        xBC_conv_t = torch.empty_like(xBC_t)
+        causal_conv1d_cuda.causal_conv1d_fwd(xBC_t, conv1d_weight, conv1d_bias, seq_idx, None, xBC_conv_t, None, activation in ["silu", "swish"])
+        xBC_conv = rearrange(xBC_conv_t, "b d s -> b s d")
         x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
         B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
@@ -1071,11 +1070,10 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             out0_recompute, out1_recompute = out_recompute.split([d_nonssm, dim], dim=-1)
         zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
         # Recompute x, B, C
-        xBC_conv = rearrange(
-            causal_conv1d_cuda.causal_conv1d_fwd(rearrange(xBC, "b s d -> b d s"),
-                                                 conv1d_weight, conv1d_bias, seq_idx, None, None, ctx.activation in ["silu", "swish"]),
-            "b d s -> b s d"
-        )
+        xBC_t = rearrange(xBC, "b s d -> b d s").contiguous()
+        xBC_conv_t = torch.empty_like(xBC_t)
+        causal_conv1d_cuda.causal_conv1d_fwd(xBC_t, conv1d_weight, conv1d_bias, seq_idx, None, xBC_conv_t, None, ctx.activation in ["silu", "swish"])
+        xBC_conv = rearrange(xBC_conv_t, "b d s -> b s d")
         x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
         B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
@@ -1104,6 +1102,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             drmsnorm_weight = None
         else:
             batch = dout.shape[0]
+            dout = dout.contiguous()  # Ensure contiguous before 2D rearrange for Triton kernel
             dy_rms = rearrange(dout, "b s h p -> (b s) (h p)")
             dz = rearrange(dz, "b l d -> (b l) d")
             x_rms = rearrange(out, "b s h p -> (b s) (h p)")
@@ -1121,11 +1120,17 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             doutproj_bias = dout_og.sum(dim=(0, 1)) if outproj_bias is not None else None
         else:
             doutproj_weight, doutproj_bias = None, None
-        dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
-        dxBC_given, dweight, dbias, *_ = causal_conv1d_cuda.causal_conv1d_bwd(
-            rearrange(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
-            rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, dxBC_given, False, ctx.activation in ["silu", "swish"]
+        dxBC_given = rearrange(dxBC_given, "b s d -> b d s").contiguous()
+        dweight = torch.zeros_like(conv1d_weight, dtype=torch.float32)
+        dbias = torch.zeros_like(conv1d_bias, dtype=torch.float32) if conv1d_bias is not None else None
+        causal_conv1d_cuda.causal_conv1d_bwd(
+            rearrange(xBC, "b s d -> b d s").contiguous(), conv1d_weight, conv1d_bias,
+            rearrange(dxBC, "b s d -> b d s").contiguous(), seq_idx, None, None, dxBC_given, dweight, dbias, None, ctx.activation in ["silu", "swish"]
         )
+        # Cast gradients back to original dtype
+        dweight = dweight.to(conv1d_weight.dtype)
+        if dbias is not None:
+            dbias = dbias.to(conv1d_bias.dtype)
         dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
         return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None
 
@@ -1195,7 +1200,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         # Merge vmap batch dim with tensor batch dim
         # zxbcdt: (vmap_batch, batch, seqlen, input_dim) -> (vmap_batch * batch, seqlen, input_dim)
         zxbcdt_shape = zxbcdt_batched.shape
-        zxbcdt_merged = zxbcdt_batched.reshape(zxbcdt_shape[0] * zxbcdt_shape[1], *zxbcdt_shape[2:])
+        zxbcdt_merged = zxbcdt_batched.reshape(zxbcdt_shape[0] * zxbcdt_shape[1], *zxbcdt_shape[2:]).contiguous()
 
         # Shared parameters - use directly or take first if batched
         # conv1d_weight: (dim + 2 * ngroups * dstate, width) - typically shared
@@ -1213,13 +1218,13 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         initial_states_merged = None
         if initial_states_batched is not None:
             is_shape = initial_states_batched.shape
-            initial_states_merged = initial_states_batched.reshape(is_shape[0] * is_shape[1], *is_shape[2:])
+            initial_states_merged = initial_states_batched.reshape(is_shape[0] * is_shape[1], *is_shape[2:]).contiguous()
 
         # seq_idx: optional, (vmap_batch, batch, seqlen) -> (vmap_batch * batch, seqlen)
         seq_idx_merged = None
         if seq_idx_batched is not None:
             si_shape = seq_idx_batched.shape
-            seq_idx_merged = seq_idx_batched.reshape(si_shape[0] * si_shape[1], *si_shape[2:])
+            seq_idx_merged = seq_idx_batched.reshape(si_shape[0] * si_shape[1], *si_shape[2:]).contiguous()
 
         # rmsnorm_weight: optional, (dim,) - typically shared
         rmsnorm_weight_merged = None
