@@ -726,7 +726,6 @@ def _layer_norm_bwd(
 class LayerNormFn(torch.autograd.Function):
     @staticmethod
     def forward(
-            ctx,
             x,
             weight,
             bias,
@@ -772,7 +771,7 @@ class LayerNormFn(torch.autograd.Function):
             if residual is not None
             else (torch.float32 if residual_in_fp32 else None)
         )
-        y, y1, mean, rstd, residual_out, seeds, dropout_mask, dropout_mask1 = _layer_norm_fwd(
+        y, y1_out, mean, rstd, residual_out, seeds, dropout_mask, dropout_mask1 = _layer_norm_fwd(
             x,
             weight,
             bias,
@@ -787,64 +786,180 @@ class LayerNormFn(torch.autograd.Function):
             is_rms_norm=is_rms_norm,
             return_dropout_mask=return_dropout_mask,
         )
-        ctx.save_for_backward(
-            residual_out, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd
+        # Track which inputs were provided
+        has_residual = residual is not None
+        has_x1 = x1 is not None
+
+        # Reshape outputs to original shape
+        y = y.reshape(x_shape_og)
+        y1_out = y1_out.reshape(x_shape_og) if y1_out is not None else None
+        residual_out_reshaped = residual_out.reshape(x_shape_og) if residual_out is not None else None
+        dropout_mask = dropout_mask.reshape(x_shape_og) if dropout_mask is not None else None
+        dropout_mask1 = dropout_mask1.reshape(x_shape_og) if dropout_mask1 is not None else None
+
+        # Return a consistent tuple structure:
+        # (y, y1, residual_out, dropout_mask, dropout_mask1,
+        #  residual_out_saved, weight_saved, bias_saved, weight1_saved, bias1_saved,
+        #  rowscale_saved, seeds_saved, mean_saved, rstd_saved,
+        #  x_shape_og, has_residual, has_x1)
+        return (
+            y,
+            y1_out,
+            residual_out_reshaped,
+            dropout_mask,
+            dropout_mask1,
+            # Saved tensors for backward (use view_as for tensors that came from input)
+            residual_out.view_as(residual_out) if residual_out is not None else None,
+            weight.view_as(weight),
+            bias.view_as(bias) if bias is not None else None,
+            weight1.view_as(weight1) if weight1 is not None else None,
+            bias1.view_as(bias1) if bias1 is not None else None,
+            rowscale.view_as(rowscale) if rowscale is not None else None,
+            seeds,  # seeds is newly created, no need for view_as
+            mean,   # mean is newly created, no need for view_as
+            rstd,   # rstd is newly created, no need for view_as
+            # Context attributes passed as part of output
+            x_shape_og,
+            has_residual,
+            has_x1,
         )
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        (x, weight, bias, residual, x1, weight1, bias1, eps, dropout_p,
+         rowscale, prenorm, residual_in_fp32, is_rms_norm, return_dropout_mask) = inputs
+
+        (y, y1_out, residual_out_reshaped, dropout_mask, dropout_mask1,
+         residual_out_saved, weight_saved, bias_saved, weight1_saved, bias1_saved,
+         rowscale_saved, seeds_saved, mean_saved, rstd_saved,
+         x_shape_og, has_residual, has_x1) = output
+
+        # Build list of tensors to save (handle None values)
+        # Order: residual_out, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd
+        # We need to track which ones are present
+        tensors_to_save = []
+        if residual_out_saved is not None:
+            tensors_to_save.append(residual_out_saved)
+        tensors_to_save.append(weight_saved)  # weight is always present
+        if bias_saved is not None:
+            tensors_to_save.append(bias_saved)
+        if weight1_saved is not None:
+            tensors_to_save.append(weight1_saved)
+        if bias1_saved is not None:
+            tensors_to_save.append(bias1_saved)
+        if rowscale_saved is not None:
+            tensors_to_save.append(rowscale_saved)
+        if seeds_saved is not None:
+            tensors_to_save.append(seeds_saved)
+        if mean_saved is not None:
+            tensors_to_save.append(mean_saved)
+        tensors_to_save.append(rstd_saved)  # rstd is always present
+
+        ctx.save_for_backward(*tensors_to_save)
+
+        # Set context attributes
         ctx.x_shape_og = x_shape_og
         ctx.eps = eps
         ctx.dropout_p = dropout_p
         ctx.is_rms_norm = is_rms_norm
-        ctx.has_residual = residual is not None
-        ctx.has_x1 = x1 is not None
+        ctx.has_residual = has_residual
+        ctx.has_x1 = has_x1
         ctx.prenorm = prenorm
         ctx.x_dtype = x.dtype
-        y = y.reshape(x_shape_og)
-        y1 = y1.reshape(x_shape_og) if y1 is not None else None
-        residual_out = residual_out.reshape(x_shape_og) if residual_out is not None else None
-        dropout_mask = dropout_mask.reshape(x_shape_og) if dropout_mask is not None else None
-        dropout_mask1 = dropout_mask1.reshape(x_shape_og) if dropout_mask1 is not None else None
-        if not return_dropout_mask:
-            if weight1 is None:
-                return y if not prenorm else (y, residual_out)
-            else:
-                return (y, y1) if not prenorm else (y, y1, residual_out)
-        else:
-            if weight1 is None:
-                return (
-                    (y, dropout_mask, dropout_mask1)
-                    if not prenorm
-                    else (y, residual_out, dropout_mask, dropout_mask1)
-                )
-            else:
-                return (
-                    (y, y1, dropout_mask, dropout_mask1)
-                    if not prenorm
-                    else (y, y1, residual_out, dropout_mask, dropout_mask1)
-                )
+        # Track which optional tensors were saved
+        ctx.has_residual_out = residual_out_saved is not None
+        ctx.has_bias = bias_saved is not None
+        ctx.has_weight1 = weight1_saved is not None
+        ctx.has_bias1 = bias1_saved is not None
+        ctx.has_rowscale = rowscale_saved is not None
+        ctx.has_seeds = seeds_saved is not None
+        ctx.has_mean = mean_saved is not None
 
     @staticmethod
-    def backward(ctx, dy, *args):
-        x, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd = ctx.saved_tensors
+    def backward(ctx, dy, dy1, dresidual_grad, ddropout_mask, ddropout_mask1, *_):
+        # Unpack saved tensors based on which ones were saved
+        saved = list(ctx.saved_tensors)
+        idx = 0
+
+        # residual_out (x) - always first if present
+        if ctx.has_residual_out:
+            x = saved[idx]
+            idx += 1
+        else:
+            x = None
+
+        # weight - always present
+        weight = saved[idx]
+        idx += 1
+
+        # bias - optional
+        if ctx.has_bias:
+            bias = saved[idx]
+            idx += 1
+        else:
+            bias = None
+
+        # weight1 - optional
+        if ctx.has_weight1:
+            weight1 = saved[idx]
+            idx += 1
+        else:
+            weight1 = None
+
+        # bias1 - optional
+        if ctx.has_bias1:
+            bias1 = saved[idx]
+            idx += 1
+        else:
+            bias1 = None
+
+        # rowscale - optional
+        if ctx.has_rowscale:
+            rowscale = saved[idx]
+            idx += 1
+        else:
+            rowscale = None
+
+        # seeds - optional
+        if ctx.has_seeds:
+            seeds = saved[idx]
+            idx += 1
+        else:
+            seeds = None
+
+        # mean - optional (not present for RMS norm)
+        if ctx.has_mean:
+            mean = saved[idx]
+            idx += 1
+        else:
+            mean = None
+
+        # rstd - always present
+        rstd = saved[idx]
+
         dy = dy.reshape(-1, dy.shape[-1])
         if dy.stride(-1) != 1:
             dy = dy.contiguous()
         assert dy.shape == x.shape
-        if weight1 is not None:
-            dy1, args = args[0], args[1:]
+
+        # Handle dy1 gradient (for weight1)
+        if ctx.has_weight1 and dy1 is not None:
             dy1 = dy1.reshape(-1, dy1.shape[-1])
             if dy1.stride(-1) != 1:
                 dy1 = dy1.contiguous()
             assert dy1.shape == x.shape
         else:
             dy1 = None
-        if ctx.prenorm:
-            dresidual = args[0]
-            dresidual = dresidual.reshape(-1, dresidual.shape[-1])
+
+        # Handle dresidual gradient (for prenorm)
+        if ctx.prenorm and dresidual_grad is not None:
+            dresidual = dresidual_grad.reshape(-1, dresidual_grad.shape[-1])
             if dresidual.stride(-1) != 1:
                 dresidual = dresidual.contiguous()
             assert dresidual.shape == x.shape
         else:
             dresidual = None
+
         dx, dw, db, dresidual_in, dx1, dw1, db1 = _layer_norm_bwd(
             dy,
             x,
@@ -873,14 +988,261 @@ class LayerNormFn(torch.autograd.Function):
             dx1.reshape(ctx.x_shape_og) if dx1 is not None else None,
             dw1,
             db1,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # eps
+            None,  # dropout_p
+            None,  # rowscale
+            None,  # prenorm
+            None,  # residual_in_fp32
+            None,  # is_rms_norm
+            None,  # return_dropout_mask
         )
+
+    @staticmethod
+    def vmap(info, in_dims, x, weight, bias, residual, x1, weight1, bias1, eps, dropout_p,
+             rowscale, prenorm, residual_in_fp32, is_rms_norm, return_dropout_mask):
+        # Handle vmap by moving batch dim to front and merging with existing batch
+        def move_bdim_to_front(tensor, bdim):
+            if bdim is None or tensor is None:
+                return tensor
+            return tensor.movedim(bdim, 0)
+
+        # in_dims order matches inputs: x, weight, bias, residual, x1, weight1, bias1,
+        # eps, dropout_p, rowscale, prenorm, residual_in_fp32, is_rms_norm, return_dropout_mask
+        x_bdim = in_dims[0]
+        weight_bdim = in_dims[1]
+        bias_bdim = in_dims[2]
+        residual_bdim = in_dims[3]
+        x1_bdim = in_dims[4]
+        weight1_bdim = in_dims[5]
+        bias1_bdim = in_dims[6]
+        rowscale_bdim = in_dims[9]
+
+        # Get vmap batch size from first batched input
+        vmap_batch_size = None
+        for tensor, bdim in [(x, x_bdim), (weight, weight_bdim), (bias, bias_bdim),
+                             (residual, residual_bdim), (x1, x1_bdim)]:
+            if bdim is not None and tensor is not None:
+                vmap_batch_size = tensor.shape[bdim]
+                break
+
+        if vmap_batch_size is None:
+            # No batched inputs, just call normally
+            result = LayerNormFn.apply(x, weight, bias, residual, x1, weight1, bias1, eps, dropout_p,
+                                       rowscale, prenorm, residual_in_fp32, is_rms_norm, return_dropout_mask)
+            # All outputs have no batch dim
+            out_dims = (None,) * len(result)
+            return result, out_dims
+
+        # Move batch dims to front
+        x_batched = move_bdim_to_front(x, x_bdim)
+        weight_batched = move_bdim_to_front(weight, weight_bdim)
+        bias_batched = move_bdim_to_front(bias, bias_bdim) if bias is not None else None
+        residual_batched = move_bdim_to_front(residual, residual_bdim) if residual is not None else None
+        x1_batched = move_bdim_to_front(x1, x1_bdim) if x1 is not None else None
+        weight1_batched = move_bdim_to_front(weight1, weight1_bdim) if weight1 is not None else None
+        bias1_batched = move_bdim_to_front(bias1, bias1_bdim) if bias1 is not None else None
+        rowscale_batched = move_bdim_to_front(rowscale, rowscale_bdim) if rowscale is not None else None
+
+        # For x, merge vmap batch with tensor's leading dims
+        # x: (..., hidden_size) - can have any leading dims
+        if x_bdim is None:
+            # x not batched, broadcast by adding vmap_batch dim
+            x_batched = x_batched.unsqueeze(0).expand(vmap_batch_size, *x_batched.shape)
+
+        # Merge vmap batch into first dimension
+        # x: (vmap_batch, batch, ..., hidden_size) -> (vmap_batch * batch, ..., hidden_size)
+        x_shape = x_batched.shape
+        x_merged = x_batched.reshape(x_shape[0] * x_shape[1], *x_shape[2:])
+
+        # Handle residual similarly if present
+        residual_merged = None
+        if residual_batched is not None:
+            if residual_bdim is None:
+                residual_batched = residual_batched.unsqueeze(0).expand(vmap_batch_size, *residual_batched.shape)
+            res_shape = residual_batched.shape
+            residual_merged = residual_batched.reshape(res_shape[0] * res_shape[1], *res_shape[2:])
+
+        # Handle x1 similarly if present
+        x1_merged = None
+        if x1_batched is not None:
+            if x1_bdim is None:
+                x1_batched = x1_batched.unsqueeze(0).expand(vmap_batch_size, *x1_batched.shape)
+            x1_shape = x1_batched.shape
+            x1_merged = x1_batched.reshape(x1_shape[0] * x1_shape[1], *x1_shape[2:])
+
+        # Handle rowscale similarly if present
+        rowscale_merged = None
+        if rowscale_batched is not None:
+            if rowscale_bdim is None:
+                rowscale_batched = rowscale_batched.unsqueeze(0).expand(vmap_batch_size, *rowscale_batched.shape)
+            rs_shape = rowscale_batched.shape
+            rowscale_merged = rowscale_batched.reshape(rs_shape[0] * rs_shape[1], *rs_shape[2:])
+
+        # weight and bias are typically not batched (shared across batch)
+        if weight_bdim is not None:
+            weight_shape = weight_batched.shape
+            weight_merged = weight_batched.reshape(weight_shape[0] * weight_shape[1], *weight_shape[2:])
+        else:
+            weight_merged = weight_batched
+
+        if bias_batched is not None:
+            if bias_bdim is not None:
+                bias_shape = bias_batched.shape
+                bias_merged = bias_batched.reshape(bias_shape[0] * bias_shape[1], *bias_shape[2:])
+            else:
+                bias_merged = bias_batched
+        else:
+            bias_merged = None
+
+        # Handle weight1 and bias1
+        if weight1_batched is not None:
+            if weight1_bdim is not None:
+                w1_shape = weight1_batched.shape
+                weight1_merged = weight1_batched.reshape(w1_shape[0] * w1_shape[1], *w1_shape[2:])
+            else:
+                weight1_merged = weight1_batched
+        else:
+            weight1_merged = None
+
+        if bias1_batched is not None:
+            if bias1_bdim is not None:
+                b1_shape = bias1_batched.shape
+                bias1_merged = bias1_batched.reshape(b1_shape[0] * b1_shape[1], *b1_shape[2:])
+            else:
+                bias1_merged = bias1_batched
+        else:
+            bias1_merged = None
+
+        # Call the function with merged batches
+        result = LayerNormFn.apply(
+            x_merged, weight_merged, bias_merged, residual_merged, x1_merged,
+            weight1_merged, bias1_merged, eps, dropout_p, rowscale_merged,
+            prenorm, residual_in_fp32, is_rms_norm, return_dropout_mask
+        )
+
+        # Unpack result - 17 items
+        (y, y1_out, residual_out, dropout_mask, dropout_mask1,
+         residual_out_saved, weight_saved, bias_saved, weight1_saved, bias1_saved,
+         rowscale_saved, seeds_saved, mean_saved, rstd_saved,
+         x_shape_og, has_residual, has_x1) = result
+
+        # Helper to unmerge batch dimension
+        def unmerge_batch(tensor, is_batched_input):
+            if tensor is None:
+                return None
+            # tensor shape: (vmap_batch * batch, ...) -> (vmap_batch, batch, ...)
+            merged_batch = tensor.shape[0]
+            original_batch = merged_batch // vmap_batch_size
+            return tensor.reshape(vmap_batch_size, original_batch, *tensor.shape[1:])
+
+        # Unmerge user-facing outputs
+        y_unmerged = unmerge_batch(y, True)
+        y1_unmerged = unmerge_batch(y1_out, True) if y1_out is not None else None
+        residual_out_unmerged = unmerge_batch(residual_out, True) if residual_out is not None else None
+        dropout_mask_unmerged = unmerge_batch(dropout_mask, True) if dropout_mask is not None else None
+        dropout_mask1_unmerged = unmerge_batch(dropout_mask1, True) if dropout_mask1 is not None else None
+
+        # Unmerge saved tensors
+        residual_out_saved_unmerged = unmerge_batch(residual_out_saved, True) if residual_out_saved is not None else None
+
+        # For weight and bias, only unmerge if they were batched
+        if weight_bdim is not None:
+            weight_saved_unmerged = weight_saved.reshape(vmap_batch_size, -1)
+        else:
+            weight_saved_unmerged = weight_saved
+
+        if bias_saved is not None:
+            if bias_bdim is not None:
+                bias_saved_unmerged = bias_saved.reshape(vmap_batch_size, -1)
+            else:
+                bias_saved_unmerged = bias_saved
+        else:
+            bias_saved_unmerged = None
+
+        if weight1_saved is not None:
+            if weight1_bdim is not None:
+                weight1_saved_unmerged = weight1_saved.reshape(vmap_batch_size, -1)
+            else:
+                weight1_saved_unmerged = weight1_saved
+        else:
+            weight1_saved_unmerged = None
+
+        if bias1_saved is not None:
+            if bias1_bdim is not None:
+                bias1_saved_unmerged = bias1_saved.reshape(vmap_batch_size, -1)
+            else:
+                bias1_saved_unmerged = bias1_saved
+        else:
+            bias1_saved_unmerged = None
+
+        if rowscale_saved is not None:
+            if rowscale_bdim is not None:
+                rowscale_saved_unmerged = rowscale_saved.reshape(vmap_batch_size, -1)
+            else:
+                rowscale_saved_unmerged = rowscale_saved
+        else:
+            rowscale_saved_unmerged = None
+
+        # seeds - 1D tensor, unmerge along first dimension
+        if seeds_saved is not None:
+            original_seeds_size = seeds_saved.shape[0] // vmap_batch_size
+            seeds_saved_unmerged = seeds_saved.reshape(vmap_batch_size, original_seeds_size)
+        else:
+            seeds_saved_unmerged = None
+
+        # mean and rstd - 1D tensors
+        if mean_saved is not None:
+            original_mean_size = mean_saved.shape[0] // vmap_batch_size
+            mean_saved_unmerged = mean_saved.reshape(vmap_batch_size, original_mean_size)
+        else:
+            mean_saved_unmerged = None
+
+        original_rstd_size = rstd_saved.shape[0] // vmap_batch_size
+        rstd_saved_unmerged = rstd_saved.reshape(vmap_batch_size, original_rstd_size)
+
+        # Build output tuple
+        result_unmerged = (
+            y_unmerged,
+            y1_unmerged,
+            residual_out_unmerged,
+            dropout_mask_unmerged,
+            dropout_mask1_unmerged,
+            residual_out_saved_unmerged,
+            weight_saved_unmerged,
+            bias_saved_unmerged,
+            weight1_saved_unmerged,
+            bias1_saved_unmerged,
+            rowscale_saved_unmerged,
+            seeds_saved_unmerged,
+            mean_saved_unmerged,
+            rstd_saved_unmerged,
+            x_shape_og,
+            has_residual,
+            has_x1,
+        )
+
+        # Build out_dims - all batched outputs have vmap batch at position 0
+        out_dims = (
+            0,  # y
+            0 if y1_out is not None else None,  # y1
+            0 if residual_out is not None else None,  # residual_out
+            0 if dropout_mask is not None else None,  # dropout_mask
+            0 if dropout_mask1 is not None else None,  # dropout_mask1
+            0 if residual_out_saved is not None else None,  # residual_out_saved
+            0 if weight_bdim is not None else None,  # weight_saved
+            0 if bias_saved is not None and bias_bdim is not None else None,  # bias_saved
+            0 if weight1_saved is not None and weight1_bdim is not None else None,  # weight1_saved
+            0 if bias1_saved is not None and bias1_bdim is not None else None,  # bias1_saved
+            0 if rowscale_saved is not None and rowscale_bdim is not None else None,  # rowscale_saved
+            0 if seeds_saved is not None else None,  # seeds_saved
+            0 if mean_saved is not None else None,  # mean_saved
+            0,  # rstd_saved
+            None,  # x_shape_og (not a tensor)
+            None,  # has_residual (not a tensor)
+            None,  # has_x1 (not a tensor)
+        )
+
+        return result_unmerged, out_dims
 
 
 def layer_norm_fn(
@@ -899,7 +1261,7 @@ def layer_norm_fn(
         is_rms_norm=False,
         return_dropout_mask=False,
 ):
-    return LayerNormFn.apply(
+    result = LayerNormFn.apply(
         x,
         weight,
         bias,
@@ -915,6 +1277,28 @@ def layer_norm_fn(
         is_rms_norm,
         return_dropout_mask,
     )
+    # Extract user-facing outputs from consistent tuple structure
+    # result = (y, y1, residual_out, dropout_mask, dropout_mask1, ...saved tensors...)
+    y, y1, residual_out, dropout_mask, dropout_mask1 = result[0], result[1], result[2], result[3], result[4]
+
+    if not return_dropout_mask:
+        if weight1 is None:
+            return y if not prenorm else (y, residual_out)
+        else:
+            return (y, y1) if not prenorm else (y, y1, residual_out)
+    else:
+        if weight1 is None:
+            return (
+                (y, dropout_mask, dropout_mask1)
+                if not prenorm
+                else (y, residual_out, dropout_mask, dropout_mask1)
+            )
+        else:
+            return (
+                (y, y1, dropout_mask, dropout_mask1)
+                if not prenorm
+                else (y, y1, residual_out, dropout_mask, dropout_mask1)
+            )
 
 
 def rms_norm_fn(
@@ -932,7 +1316,7 @@ def rms_norm_fn(
         residual_in_fp32=False,
         return_dropout_mask=False,
 ):
-    return LayerNormFn.apply(
+    result = LayerNormFn.apply(
         x,
         weight,
         bias,
@@ -945,9 +1329,30 @@ def rms_norm_fn(
         rowscale,
         prenorm,
         residual_in_fp32,
-        True,
+        True,  # is_rms_norm=True
         return_dropout_mask,
     )
+    # Extract user-facing outputs from consistent tuple structure
+    y, y1, residual_out, dropout_mask, dropout_mask1 = result[0], result[1], result[2], result[3], result[4]
+
+    if not return_dropout_mask:
+        if weight1 is None:
+            return y if not prenorm else (y, residual_out)
+        else:
+            return (y, y1) if not prenorm else (y, y1, residual_out)
+    else:
+        if weight1 is None:
+            return (
+                (y, dropout_mask, dropout_mask1)
+                if not prenorm
+                else (y, residual_out, dropout_mask, dropout_mask1)
+            )
+        else:
+            return (
+                (y, y1, dropout_mask, dropout_mask1)
+                if not prenorm
+                else (y, y1, residual_out, dropout_mask, dropout_mask1)
+            )
 
 
 class RMSNorm(torch.nn.Module):
@@ -984,7 +1389,6 @@ class LayerNormLinearFn(torch.autograd.Function):
     @staticmethod
     @custom_fwd
     def forward(
-            ctx,
             x,
             norm_weight,
             norm_bias,
@@ -997,6 +1401,7 @@ class LayerNormLinearFn(torch.autograd.Function):
             is_rms_norm=False,
     ):
         x_shape_og = x.shape
+        x_dtype = x.dtype
         # reshape input data into 2D tensor
         x = x.reshape(-1, x.shape[-1])
         if x.stride(-1) != 1:
@@ -1029,30 +1434,115 @@ class LayerNormLinearFn(torch.autograd.Function):
         linear_weight = linear_weight.to(dtype)
         linear_bias = linear_bias.to(dtype) if linear_bias is not None else None
         out = F.linear(y.to(linear_weight.dtype), linear_weight, linear_bias)
-        # We don't store y, will be recomputed in the backward pass to save memory
-        ctx.save_for_backward(residual_out, norm_weight, norm_bias, linear_weight, mean, rstd)
+
+        # Track which inputs were provided
+        has_residual = residual is not None
+        linear_bias_is_none = linear_bias is None
+
+        # Return a consistent tuple structure:
+        # (out, residual_out_reshaped,  # User-facing outputs
+        #  residual_out_saved, norm_weight_saved, norm_bias_saved,  # Saved tensors
+        #  linear_weight_saved, mean_saved, rstd_saved,
+        #  x_shape_og, eps, is_rms_norm, has_residual, prenorm, x_dtype, linear_bias_is_none)
+        return (
+            out,
+            residual_out.reshape(x_shape_og) if prenorm else None,
+            # Saved tensors for backward (use view_as for tensors)
+            residual_out.view_as(residual_out),
+            norm_weight.view_as(norm_weight),
+            norm_bias.view_as(norm_bias) if norm_bias is not None else None,
+            linear_weight.view_as(linear_weight),
+            mean,  # mean is newly created, no need for view_as
+            rstd,  # rstd is newly created, no need for view_as
+            # Context attributes passed as part of output
+            x_shape_og,
+            eps,
+            is_rms_norm,
+            has_residual,
+            prenorm,
+            x_dtype,
+            linear_bias_is_none,
+        )
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        (x, norm_weight, norm_bias, linear_weight, linear_bias, residual,
+         eps, prenorm, residual_in_fp32, is_rms_norm) = inputs
+
+        (out, residual_out_reshaped,
+         residual_out_saved, norm_weight_saved, norm_bias_saved,
+         linear_weight_saved, mean_saved, rstd_saved,
+         x_shape_og, eps_out, is_rms_norm_out, has_residual, prenorm_out, x_dtype, linear_bias_is_none) = output
+
+        # Build list of tensors to save (handle None values)
+        tensors_to_save = [residual_out_saved, norm_weight_saved]
+        if norm_bias_saved is not None:
+            tensors_to_save.append(norm_bias_saved)
+        tensors_to_save.append(linear_weight_saved)
+        if mean_saved is not None:
+            tensors_to_save.append(mean_saved)
+        tensors_to_save.append(rstd_saved)
+
+        ctx.save_for_backward(*tensors_to_save)
+
+        # Set context attributes
         ctx.x_shape_og = x_shape_og
         ctx.eps = eps
         ctx.is_rms_norm = is_rms_norm
-        ctx.has_residual = residual is not None
+        ctx.has_residual = has_residual
         ctx.prenorm = prenorm
-        ctx.x_dtype = x.dtype
-        ctx.linear_bias_is_none = linear_bias is None
-        return out if not prenorm else (out, residual_out.reshape(x_shape_og))
+        ctx.x_dtype = x_dtype
+        ctx.linear_bias_is_none = linear_bias_is_none
+        ctx.has_norm_bias = norm_bias_saved is not None
+        ctx.has_mean = mean_saved is not None
+        # Required for @custom_bwd decorator to work with setup_context pattern
+        ctx._fwd_used_autocast = torch.is_autocast_enabled()
+        ctx._dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else None
 
     @staticmethod
     @custom_bwd
-    def backward(ctx, dout, *args):
-        x, norm_weight, norm_bias, linear_weight, mean, rstd = ctx.saved_tensors
+    def backward(ctx, dout, dresidual_out_grad, *_):
+        # Unpack saved tensors based on which ones were saved
+        saved = list(ctx.saved_tensors)
+        idx = 0
+
+        # residual_out (x) - always present
+        x = saved[idx]
+        idx += 1
+
+        # norm_weight - always present
+        norm_weight = saved[idx]
+        idx += 1
+
+        # norm_bias - optional
+        if ctx.has_norm_bias:
+            norm_bias = saved[idx]
+            idx += 1
+        else:
+            norm_bias = None
+
+        # linear_weight - always present
+        linear_weight = saved[idx]
+        idx += 1
+
+        # mean - optional (not present for RMS norm)
+        if ctx.has_mean:
+            mean = saved[idx]
+            idx += 1
+        else:
+            mean = None
+
+        # rstd - always present
+        rstd = saved[idx]
+
         dout = dout.reshape(-1, dout.shape[-1])
         dy = F.linear(dout, linear_weight.t())
         dlinear_bias = None if ctx.linear_bias_is_none else dout.sum(0)
         if dy.stride(-1) != 1:
             dy = dy.contiguous()
         assert dy.shape == x.shape
-        if ctx.prenorm:
-            dresidual = args[0]
-            dresidual = dresidual.reshape(-1, dresidual.shape[-1])
+        if ctx.prenorm and dresidual_out_grad is not None:
+            dresidual = dresidual_out_grad.reshape(-1, dresidual_out_grad.shape[-1])
             if dresidual.stride(-1) != 1:
                 dresidual = dresidual.contiguous()
             assert dresidual.shape == x.shape
@@ -1080,11 +1570,197 @@ class LayerNormLinearFn(torch.autograd.Function):
             dlinear_weight,
             dlinear_bias,
             dresidual_in.reshape(ctx.x_shape_og) if ctx.has_residual else None,
-            None,
-            None,
-            None,
-            None,
+            None,  # eps
+            None,  # prenorm
+            None,  # residual_in_fp32
+            None,  # is_rms_norm
         )
+
+    @staticmethod
+    def vmap(info, in_dims, x, norm_weight, norm_bias, linear_weight, linear_bias,
+             residual, eps, prenorm, residual_in_fp32, is_rms_norm):
+        # Handle vmap by moving batch dim to front and merging with existing batch
+        def move_bdim_to_front(tensor, bdim):
+            if bdim is None or tensor is None:
+                return tensor
+            return tensor.movedim(bdim, 0)
+
+        # in_dims order: x, norm_weight, norm_bias, linear_weight, linear_bias,
+        #                residual, eps, prenorm, residual_in_fp32, is_rms_norm
+        x_bdim = in_dims[0]
+        norm_weight_bdim = in_dims[1]
+        norm_bias_bdim = in_dims[2]
+        linear_weight_bdim = in_dims[3]
+        linear_bias_bdim = in_dims[4]
+        residual_bdim = in_dims[5]
+
+        # Get vmap batch size from first batched input
+        vmap_batch_size = None
+        for tensor, bdim in [(x, x_bdim), (norm_weight, norm_weight_bdim),
+                             (residual, residual_bdim)]:
+            if bdim is not None and tensor is not None:
+                vmap_batch_size = tensor.shape[bdim]
+                break
+
+        if vmap_batch_size is None:
+            # No batched inputs, just call normally
+            result = LayerNormLinearFn.apply(x, norm_weight, norm_bias, linear_weight, linear_bias,
+                                             residual, eps, prenorm, residual_in_fp32, is_rms_norm)
+            out_dims = (None,) * len(result)
+            return result, out_dims
+
+        # Move batch dims to front
+        x_batched = move_bdim_to_front(x, x_bdim)
+        norm_weight_batched = move_bdim_to_front(norm_weight, norm_weight_bdim)
+        norm_bias_batched = move_bdim_to_front(norm_bias, norm_bias_bdim) if norm_bias is not None else None
+        linear_weight_batched = move_bdim_to_front(linear_weight, linear_weight_bdim)
+        linear_bias_batched = move_bdim_to_front(linear_bias, linear_bias_bdim) if linear_bias is not None else None
+        residual_batched = move_bdim_to_front(residual, residual_bdim) if residual is not None else None
+
+        # For x, merge vmap batch with tensor's leading dims
+        if x_bdim is None:
+            x_batched = x_batched.unsqueeze(0).expand(vmap_batch_size, *x_batched.shape)
+
+        # Merge vmap batch into first dimension
+        x_shape = x_batched.shape
+        x_merged = x_batched.reshape(x_shape[0] * x_shape[1], *x_shape[2:])
+
+        # Handle residual similarly if present
+        residual_merged = None
+        if residual_batched is not None:
+            if residual_bdim is None:
+                residual_batched = residual_batched.unsqueeze(0).expand(vmap_batch_size, *residual_batched.shape)
+            res_shape = residual_batched.shape
+            residual_merged = residual_batched.reshape(res_shape[0] * res_shape[1], *res_shape[2:])
+
+        # norm_weight and norm_bias are typically not batched (shared)
+        if norm_weight_bdim is not None:
+            nw_shape = norm_weight_batched.shape
+            norm_weight_merged = norm_weight_batched.reshape(nw_shape[0] * nw_shape[1], *nw_shape[2:])
+        else:
+            norm_weight_merged = norm_weight_batched
+
+        if norm_bias_batched is not None:
+            if norm_bias_bdim is not None:
+                nb_shape = norm_bias_batched.shape
+                norm_bias_merged = norm_bias_batched.reshape(nb_shape[0] * nb_shape[1], *nb_shape[2:])
+            else:
+                norm_bias_merged = norm_bias_batched
+        else:
+            norm_bias_merged = None
+
+        # linear_weight and linear_bias are typically not batched (shared)
+        if linear_weight_bdim is not None:
+            lw_shape = linear_weight_batched.shape
+            linear_weight_merged = linear_weight_batched.reshape(lw_shape[0] * lw_shape[1], *lw_shape[2:])
+        else:
+            linear_weight_merged = linear_weight_batched
+
+        if linear_bias_batched is not None:
+            if linear_bias_bdim is not None:
+                lb_shape = linear_bias_batched.shape
+                linear_bias_merged = linear_bias_batched.reshape(lb_shape[0] * lb_shape[1], *lb_shape[2:])
+            else:
+                linear_bias_merged = linear_bias_batched
+        else:
+            linear_bias_merged = None
+
+        # Call the function with merged batches
+        result = LayerNormLinearFn.apply(
+            x_merged, norm_weight_merged, norm_bias_merged, linear_weight_merged, linear_bias_merged,
+            residual_merged, eps, prenorm, residual_in_fp32, is_rms_norm
+        )
+
+        # Unpack result - 15 items
+        (out, residual_out_reshaped,
+         residual_out_saved, norm_weight_saved, norm_bias_saved,
+         linear_weight_saved, mean_saved, rstd_saved,
+         x_shape_og, eps_out, is_rms_norm_out, has_residual, prenorm_out, x_dtype, linear_bias_is_none) = result
+
+        # Helper to unmerge batch dimension
+        def unmerge_batch(tensor):
+            if tensor is None:
+                return None
+            merged_batch = tensor.shape[0]
+            original_batch = merged_batch // vmap_batch_size
+            return tensor.reshape(vmap_batch_size, original_batch, *tensor.shape[1:])
+
+        # Unmerge user-facing outputs
+        out_unmerged = unmerge_batch(out)
+        residual_out_reshaped_unmerged = unmerge_batch(residual_out_reshaped) if residual_out_reshaped is not None else None
+
+        # Unmerge saved tensors
+        residual_out_saved_unmerged = unmerge_batch(residual_out_saved)
+
+        # For norm_weight and norm_bias, only unmerge if they were batched
+        if norm_weight_bdim is not None:
+            norm_weight_saved_unmerged = norm_weight_saved.reshape(vmap_batch_size, -1)
+        else:
+            norm_weight_saved_unmerged = norm_weight_saved
+
+        if norm_bias_saved is not None:
+            if norm_bias_bdim is not None:
+                norm_bias_saved_unmerged = norm_bias_saved.reshape(vmap_batch_size, -1)
+            else:
+                norm_bias_saved_unmerged = norm_bias_saved
+        else:
+            norm_bias_saved_unmerged = None
+
+        # For linear_weight, only unmerge if batched
+        if linear_weight_bdim is not None:
+            linear_weight_saved_unmerged = linear_weight_saved.reshape(vmap_batch_size, linear_weight_saved.shape[0] // vmap_batch_size, -1)
+        else:
+            linear_weight_saved_unmerged = linear_weight_saved
+
+        # mean and rstd - 1D tensors
+        if mean_saved is not None:
+            original_mean_size = mean_saved.shape[0] // vmap_batch_size
+            mean_saved_unmerged = mean_saved.reshape(vmap_batch_size, original_mean_size)
+        else:
+            mean_saved_unmerged = None
+
+        original_rstd_size = rstd_saved.shape[0] // vmap_batch_size
+        rstd_saved_unmerged = rstd_saved.reshape(vmap_batch_size, original_rstd_size)
+
+        # Build output tuple
+        result_unmerged = (
+            out_unmerged,
+            residual_out_reshaped_unmerged,
+            residual_out_saved_unmerged,
+            norm_weight_saved_unmerged,
+            norm_bias_saved_unmerged,
+            linear_weight_saved_unmerged,
+            mean_saved_unmerged,
+            rstd_saved_unmerged,
+            x_shape_og,
+            eps_out,
+            is_rms_norm_out,
+            has_residual,
+            prenorm_out,
+            x_dtype,
+            linear_bias_is_none,
+        )
+
+        # Build out_dims - all batched outputs have vmap batch at position 0
+        out_dims = (
+            0,  # out
+            0 if residual_out_reshaped is not None else None,  # residual_out_reshaped
+            0,  # residual_out_saved
+            0 if norm_weight_bdim is not None else None,  # norm_weight_saved
+            0 if norm_bias_saved is not None and norm_bias_bdim is not None else None,  # norm_bias_saved
+            0 if linear_weight_bdim is not None else None,  # linear_weight_saved
+            0 if mean_saved is not None else None,  # mean_saved
+            0,  # rstd_saved
+            None,  # x_shape_og (not a tensor)
+            None,  # eps (not a tensor)
+            None,  # is_rms_norm (not a tensor)
+            None,  # has_residual (not a tensor)
+            None,  # prenorm (not a tensor)
+            None,  # x_dtype (not a tensor)
+            None,  # linear_bias_is_none (not a tensor)
+        )
+
+        return result_unmerged, out_dims
 
 
 def layer_norm_linear_fn(
@@ -1099,7 +1775,7 @@ def layer_norm_linear_fn(
         residual_in_fp32=False,
         is_rms_norm=False,
 ):
-    return LayerNormLinearFn.apply(
+    result = LayerNormLinearFn.apply(
         x,
         norm_weight,
         norm_bias,
@@ -1111,3 +1787,7 @@ def layer_norm_linear_fn(
         residual_in_fp32,
         is_rms_norm,
     )
+    # Extract user-facing outputs from consistent tuple structure
+    # result = (out, residual_out_reshaped, ...saved tensors...)
+    out, residual_out_reshaped = result[0], result[1]
+    return out if not prenorm else (out, residual_out_reshaped)

@@ -793,7 +793,7 @@ def _chunk_state_bwd_ddAcs_stable(B, x, dt, dA_cumsum, dstates, seq_idx=None):
 class ChunkStateFn(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, B, x, dt, dA_cumsum, states_in_fp32=True):
+    def forward(B, x, dt, dA_cumsum, states_in_fp32=True):
         batch, seqlen, nheads, headdim = x.shape
         _, _, nchunks, chunk_size = dt.shape
         assert seqlen <= nchunks * chunk_size
@@ -806,11 +806,18 @@ class ChunkStateFn(torch.autograd.Function):
         if x.stride(-1) != 1 and x.stride(1) != 1:  # Either M or K dimension should be contiguous
             x = x.contiguous()
         states = _chunk_state_fwd(B, x, dt, dA_cumsum, states_in_fp32=states_in_fp32)
-        ctx.save_for_backward(B, x, dt, dA_cumsum)
-        return states
+        # Return states and views of tensors needed for backward
+        # (PyTorch requires views, not the original tensors, when using setup_context)
+        return states, B.view_as(B), x.view_as(x), dt.view_as(dt), dA_cumsum.view_as(dA_cumsum)
 
     @staticmethod
-    def backward(ctx, dstates):
+    def setup_context(ctx, inputs, output):
+        B, x, dt, dA_cumsum, states_in_fp32 = inputs
+        states, B_saved, x_saved, dt_saved, dA_cumsum_saved = output
+        ctx.save_for_backward(B_saved, x_saved, dt_saved, dA_cumsum_saved)
+
+    @staticmethod
+    def backward(ctx, dstates, *_):
         B, x, dt, dA_cumsum = ctx.saved_tensors
         batch, seqlen, nheads, headdim = x.shape
         _, _, nchunks, chunk_size = dt.shape
@@ -823,6 +830,74 @@ class ChunkStateFn(torch.autograd.Function):
         dB = dB.to(B.dtype)
         return dB, dx, ddt, ddA_cumsum, None
 
+    @staticmethod
+    def vmap(info, in_dims, B, x, dt, dA_cumsum, states_in_fp32):
+        # Handle vmap by moving batch dim to front and merging with existing batch
+        def move_bdim_to_front(tensor, bdim):
+            if bdim is None:
+                return tensor
+            return tensor.movedim(bdim, 0)
+
+        # Get vmap batch size from first batched input
+        vmap_batch_size = None
+        for tensor, bdim in zip([B, x, dt, dA_cumsum], in_dims[:4]):
+            if bdim is not None:
+                vmap_batch_size = tensor.shape[bdim]
+                break
+
+        # Move batch dims to front
+        B_batched = move_bdim_to_front(B, in_dims[0])
+        x_batched = move_bdim_to_front(x, in_dims[1])
+        dt_batched = move_bdim_to_front(dt, in_dims[2])
+        dA_cumsum_batched = move_bdim_to_front(dA_cumsum, in_dims[3])
+
+        # If some inputs are not batched, broadcast them
+        if in_dims[0] is None:
+            B_batched = B_batched.unsqueeze(0).expand(vmap_batch_size, *B_batched.shape)
+        if in_dims[1] is None:
+            x_batched = x_batched.unsqueeze(0).expand(vmap_batch_size, *x_batched.shape)
+        if in_dims[2] is None:
+            dt_batched = dt_batched.unsqueeze(0).expand(vmap_batch_size, *dt_batched.shape)
+        if in_dims[3] is None:
+            dA_cumsum_batched = dA_cumsum_batched.unsqueeze(0).expand(vmap_batch_size, *dA_cumsum_batched.shape)
+
+        # Merge vmap batch dim with tensor batch dim
+        # B: (vmap_batch, batch, seqlen, ngroups, dstate) -> (vmap_batch * batch, seqlen, ngroups, dstate)
+        B_shape = B_batched.shape
+        B_merged = B_batched.reshape(B_shape[0] * B_shape[1], *B_shape[2:])
+
+        # x: (vmap_batch, batch, seqlen, nheads, headdim) -> (vmap_batch * batch, seqlen, nheads, headdim)
+        x_shape = x_batched.shape
+        x_merged = x_batched.reshape(x_shape[0] * x_shape[1], *x_shape[2:])
+
+        # dt: (vmap_batch, batch, nheads, nchunks, chunk_size) -> (vmap_batch * batch, nheads, nchunks, chunk_size)
+        dt_shape = dt_batched.shape
+        dt_merged = dt_batched.reshape(dt_shape[0] * dt_shape[1], *dt_shape[2:])
+
+        # dA_cumsum: same shape as dt
+        dA_cumsum_shape = dA_cumsum_batched.shape
+        dA_cumsum_merged = dA_cumsum_batched.reshape(dA_cumsum_shape[0] * dA_cumsum_shape[1], *dA_cumsum_shape[2:])
+
+        # Call the function with merged batches
+        states, B_out, x_out, dt_out, dA_cumsum_out = ChunkStateFn.apply(
+            B_merged, x_merged, dt_merged, dA_cumsum_merged, states_in_fp32
+        )
+
+        # Unmerge: states shape is (vmap_batch * batch, nchunks, nheads, headdim, dstate)
+        # -> (vmap_batch, batch, nchunks, nheads, headdim, dstate)
+        merged_batch = states.shape[0]
+        original_batch = merged_batch // vmap_batch_size
+        states_unmerged = states.reshape(vmap_batch_size, original_batch, *states.shape[1:])
+
+        # Unmerge other outputs
+        B_unmerged = B_out.reshape(vmap_batch_size, original_batch, *B_out.shape[1:])
+        x_unmerged = x_out.reshape(vmap_batch_size, original_batch, *x_out.shape[1:])
+        dt_unmerged = dt_out.reshape(vmap_batch_size, original_batch, *dt_out.shape[1:])
+        dA_cumsum_unmerged = dA_cumsum_out.reshape(vmap_batch_size, original_batch, *dA_cumsum_out.shape[1:])
+
+        # Return (outputs, out_dims) - all outputs have vmap batch dim at position 0
+        return (states_unmerged, B_unmerged, x_unmerged, dt_unmerged, dA_cumsum_unmerged), (0, 0, 0, 0, 0)
+
 
 def chunk_state(B, x, dt, dA_cumsum, states_in_fp32=True):
     """
@@ -834,7 +909,8 @@ def chunk_state(B, x, dt, dA_cumsum, states_in_fp32=True):
     Return:
         states: (batch, nchunks, nheads, headdim, dstate)
     """
-    return ChunkStateFn.apply(B, x, dt, dA_cumsum, states_in_fp32)
+    result = ChunkStateFn.apply(B, x, dt, dA_cumsum, states_in_fp32)
+    return result[0]  # Extract only user-facing output (states)
 
 
 def chunk_state_ref(B, x, dt, dA_cumsum):
